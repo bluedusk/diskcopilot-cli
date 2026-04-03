@@ -592,6 +592,35 @@ pub fn query_dev_artifacts(conn: &Connection) -> Result<Vec<TreeNode>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Search for directories by name (case-insensitive substring match).
+pub fn query_dirs_by_name(conn: &Connection, name: &str, limit: usize) -> Result<Vec<TreeNode>> {
+    let pattern = format!("%{}%", name);
+    let mut stmt = conn.prepare(
+        "SELECT id, name, total_disk_size, total_logical_size, total_file_count,
+                created_at, modified_at
+         FROM dirs
+         WHERE name LIKE ?1
+         ORDER BY total_disk_size DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+        Ok(TreeNode {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            is_dir: true,
+            disk_size: row.get::<_, i64>(2)? as u64,
+            logical_size: row.get::<_, i64>(3)? as u64,
+            file_count: row.get::<_, i64>(4)? as u64,
+            created_at: row.get(5)?,
+            modified_at: row.get(6)?,
+            extension: None,
+            children: Vec::new(),
+            dir_id: None,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 // ---------------------------------------------------------------------------
 // Duplicate detection
 // ---------------------------------------------------------------------------

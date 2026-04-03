@@ -1,8 +1,8 @@
 use diskcopilot::cache::{self, schema, writer};
 use diskcopilot::cache::reader::{
     find_duplicates, load_root, load_scan_meta, load_tree_to_depth,
-    query_by_extension, query_by_name, query_dev_artifacts, query_large_files,
-    query_old_files, query_recent_files, query_summary,
+    query_by_extension, query_by_name, query_dev_artifacts,
+    query_large_files, query_old_files, query_recent_files, query_summary,
 };
 use diskcopilot::cache::writer::ScanMeta;
 use diskcopilot::delete::trash::{delete_permanent, move_to_trash};
@@ -12,6 +12,7 @@ use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
 #[cfg(target_os = "macos")]
 use diskcopilot::scanner::bulk_walker::{scan_directory_bulk, supports_bulk_attrs};
 use diskcopilot::output;
+use diskcopilot::server;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -77,6 +78,21 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Start interactive cleanup web UI
+    Serve {
+        /// Path that was scanned
+        path: PathBuf,
+        /// Port to listen on
+        #[arg(long, default_value = "3847")]
+        port: u16,
+        /// AI-generated insights text to display
+        #[arg(long)]
+        insights: Option<String>,
+        /// Path to a file containing AI insights
+        #[arg(long)]
+        insights_file: Option<PathBuf>,
     },
 }
 
@@ -166,6 +182,13 @@ enum QueryCommand {
         limit: usize,
         #[arg(long)]
         json: bool,
+    },
+    /// Run a raw SQL query against the cache database
+    Sql {
+        /// SQL query to execute (read-only)
+        query: String,
+        /// Path that was scanned
+        path: PathBuf,
     },
     /// Cleanup summary report
     Summary {
@@ -525,6 +548,39 @@ fn run_query(command: QueryCommand) -> anyhow::Result<()> {
                 }
             }
         }
+        QueryCommand::Sql { query, path } => {
+            let conn = open_cache(&path)?;
+            // Only allow read-only queries
+            let q = query.trim().to_uppercase();
+            if !q.starts_with("SELECT") && !q.starts_with("WITH") && !q.starts_with("PRAGMA") {
+                anyhow::bail!("Only SELECT, WITH, and PRAGMA statements are allowed");
+            }
+            let mut stmt = conn.prepare(&query)?;
+            let col_count = stmt.column_count();
+            let col_names: Vec<String> = (0..col_count)
+                .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+                .collect();
+
+            let rows = stmt.query_map([], |row| {
+                let mut map = serde_json::Map::new();
+                for (i, col_name) in col_names.iter().enumerate() {
+                    let val: rusqlite::types::Value = row.get(i)?;
+                    let json_val = match val {
+                        rusqlite::types::Value::Null => serde_json::Value::Null,
+                        rusqlite::types::Value::Integer(n) => serde_json::json!(n),
+                        rusqlite::types::Value::Real(f) => serde_json::json!(f),
+                        rusqlite::types::Value::Text(s) => serde_json::json!(s),
+                        rusqlite::types::Value::Blob(b) => serde_json::json!(format!("<blob {} bytes>", b.len())),
+                    };
+                    map.insert(col_name.clone(), json_val);
+                }
+                Ok(serde_json::Value::Object(map))
+            })?;
+
+            let result: Vec<serde_json::Value> = rows
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
     }
     Ok(())
 }
@@ -582,5 +638,18 @@ async fn main() -> anyhow::Result<()> {
             permanent,
             json,
         } => run_delete(path, trash, permanent, json),
+        Commands::Serve {
+            path,
+            port,
+            insights,
+            insights_file,
+        } => {
+            let insights_content = if let Some(file) = insights_file {
+                Some(std::fs::read_to_string(file)?)
+            } else {
+                insights
+            };
+            server::serve(path, port, insights_content).await
+        }
     }
 }

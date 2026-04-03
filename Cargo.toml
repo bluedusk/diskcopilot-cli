@@ -32,6 +32,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
+# Web server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
 # Utils
 libc = "0.2"
 dirs = "5"

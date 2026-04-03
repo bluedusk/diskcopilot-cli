@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>diskcopilot — Cleanup</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --text2: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --trash-bg: #1a1207;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
+         background: var(--bg); color: var(--text); line-height: 1.5; }
+
+  /* Header */
+  .header { padding: 20px 24px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 20px; font-weight: 600; }
+  .header h1 span { color: var(--text2); font-weight: 400; }
+  .stats { display: flex; gap: 24px; }
+  .stat { text-align: right; }
+  .stat-value { font-size: 24px; font-weight: 700; }
+  .stat-label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-value.green { color: var(--green); }
+
+  /* Layout */
+  .layout { display: flex; height: calc(100vh - 73px); }
+  .sidebar { width: 320px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
+  .main { flex: 1; overflow-y: auto; padding: 24px; }
+
+  /* Sidebar nav */
+  .nav-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid var(--border);
+              display: flex; justify-content: space-between; align-items: center;
+              transition: background 0.15s; }
+  .nav-item:hover { background: var(--surface); }
+  .nav-item.active { background: var(--surface); border-left: 3px solid var(--accent); }
+  .nav-item .label { font-size: 14px; font-weight: 500; }
+  .nav-item .count { font-size: 12px; color: var(--text2); }
+  .nav-item .size { font-size: 14px; font-weight: 600; }
+
+  /* AI Insights panel */
+  .insights { background: linear-gradient(135deg, #1a1f35, #161b22); border: 1px solid #2d3a5e;
+              border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+  .insights h2 { font-size: 16px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .insights .badge { background: #2d3a5e; color: var(--accent); font-size: 11px; padding: 2px 8px;
+                     border-radius: 10px; font-weight: 500; }
+  .insights-content { font-size: 14px; color: var(--text2); white-space: pre-wrap; }
+  .insights-content strong { color: var(--text); }
+
+  /* Item list */
+  .item-list { display: flex; flex-direction: column; gap: 2px; }
+  .item { display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+          background: var(--surface); border-radius: 6px; transition: all 0.15s; }
+  .item:hover { background: #1c2333; }
+  .item.selected { background: var(--trash-bg); border: 1px solid #3d2e0a; }
+  .item input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+  .item-info { flex: 1; min-width: 0; }
+  .item-name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item-path { font-size: 12px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item-size { font-size: 14px; font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+  .item-bar { width: 80px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
+  .item-bar-fill { height: 100%; border-radius: 3px; }
+  .item .tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0; }
+  .tag-safe { background: #0d2818; color: var(--green); }
+  .tag-review { background: #2a1f04; color: var(--yellow); }
+  .tag-keep { background: #2a0d0d; color: var(--red); }
+
+  /* Section header */
+  .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .section-header h2 { font-size: 18px; }
+  .select-all { font-size: 13px; color: var(--accent); cursor: pointer; border: none; background: none; }
+  .select-all:hover { text-decoration: underline; }
+
+  /* Floating action bar */
+  .action-bar { position: fixed; bottom: 0; left: 0; right: 0; padding: 16px 24px;
+                background: var(--surface); border-top: 1px solid var(--border);
+                display: flex; align-items: center; justify-content: space-between;
+                transform: translateY(100%); transition: transform 0.3s ease; z-index: 100; }
+  .action-bar.visible { transform: translateY(0); }
+  .action-bar .summary { font-size: 14px; }
+  .action-bar .summary strong { color: var(--yellow); }
+  .btn-trash { background: var(--red); color: white; border: none; padding: 10px 24px;
+               border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer;
+               transition: opacity 0.15s; }
+  .btn-trash:hover { opacity: 0.85; }
+  .btn-trash:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Tree view */
+  .tree-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+  .tree-indent { flex-shrink: 0; }
+  .tree-icon { font-size: 14px; flex-shrink: 0; }
+  .tree-name { font-size: 14px; }
+  .tree-size { font-size: 13px; color: var(--text2); margin-left: auto; }
+  .tree-bar { width: 120px; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+  .tree-bar-fill { height: 100%; border-radius: 4px; }
+
+  /* Loading */
+  .loading { display: flex; align-items: center; justify-content: center; height: 200px; color: var(--text2); }
+  .spinner { width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent);
+             border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Toast */
+  .toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px;
+           font-size: 14px; z-index: 200; animation: slideIn 0.3s ease; }
+  .toast-success { background: #0d2818; border: 1px solid var(--green); color: var(--green); }
+  .toast-error { background: #2a0d0d; border: 1px solid var(--red); color: var(--red); }
+  @keyframes slideIn { from { transform: translateX(100px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 60px 24px; color: var(--text2); }
+  .empty h3 { font-size: 18px; margin-bottom: 8px; color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>diskcopilot <span id="scan-path"></span></h1>
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-value" id="total-size">-</div>
+      <div class="stat-label">Total used</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value green" id="selected-size">0 B</div>
+      <div class="stat-label">Selected to trash</div>
+    </div>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+    <div class="nav-item active" data-view="insights">
+      <span class="label">AI Insights</span>
+    </div>
+    <div class="nav-item" data-view="overview">
+      <span class="label">Overview</span>
+    </div>
+    <div class="nav-item" data-view="large-files">
+      <div><span class="label">Large Files</span> <span class="count" id="large-count"></span></div>
+      <span class="size" id="large-size"></span>
+    </div>
+    <div class="nav-item" data-view="dev-artifacts">
+      <div><span class="label">Dev Artifacts</span> <span class="count" id="dev-count"></span></div>
+      <span class="size" id="dev-size"></span>
+    </div>
+    <div class="nav-item" data-view="old-files">
+      <div><span class="label">Old Files</span> <span class="count" id="old-count"></span></div>
+      <span class="size" id="old-size"></span>
+    </div>
+  </div>
+
+  <div class="main" id="main-content">
+    <div class="loading"><div class="spinner"></div>Loading...</div>
+  </div>
+</div>
+
+<div class="action-bar" id="action-bar">
+  <div class="summary">
+    <strong id="selected-count">0</strong> items selected
+    (<strong id="selected-total">0 B</strong>)
+  </div>
+  <button class="btn-trash" id="btn-trash" onclick="trashSelected()">Move to Trash</button>
+</div>
+
+<script>
+const API = '';
+const AUTH_TOKEN = '__AUTH_TOKEN__';
+let data = { tree: null, largeFiles: [], devArtifacts: [], oldFiles: [], summary: null, info: null, insights: null };
+let selected = new Map(); // path -> size
+
+// --- Helpers ---
+function fmt(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, s = bytes;
+  while (s >= 1000 && i < units.length - 1) { s /= 1000; i++; }
+  return i === 0 ? `${s} B` : `${s.toFixed(1)} ${units[i]}`;
+}
+
+function pct(part, total) { return total > 0 ? (part / total * 100).toFixed(1) : 0; }
+
+function barColor(ratio) {
+  return ratio > 0.5 ? 'var(--red)' : ratio > 0.2 ? 'var(--yellow)' : 'var(--green)';
+}
+
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+function updateSelection() {
+  let totalSize = 0;
+  selected.forEach(s => totalSize += s);
+  document.getElementById('selected-size').textContent = fmt(totalSize);
+  document.getElementById('selected-count').textContent = selected.size;
+  document.getElementById('selected-total').textContent = fmt(totalSize);
+  document.getElementById('action-bar').classList.toggle('visible', selected.size > 0);
+}
+
+function toggleItem(path, size, checkbox) {
+  if (selected.has(path)) { selected.delete(path); } else { selected.set(path, size); }
+  checkbox.closest('.item').classList.toggle('selected', selected.has(path));
+  updateSelection();
+}
+
+// --- API calls ---
+async function fetchJSON(url) {
+  const res = await fetch(API + url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+async function loadAll() {
+  try {
+    const [info, tree, large, dev, old, summary, insights] = await Promise.all([
+      fetchJSON('/api/info'),
+      fetchJSON('/api/tree?depth=2'),
+      fetchJSON('/api/large-files?limit=50'),
+      fetchJSON('/api/dev-artifacts'),
+      fetchJSON('/api/old-files?days=365&limit=50'),
+      fetchJSON('/api/summary'),
+      fetchJSON('/api/insights').catch(() => null),
+    ]);
+    data = { info, tree, largeFiles: large, devArtifacts: dev, oldFiles: old, summary, insights };
+    updateHeader();
+    updateSidebar();
+    showView('insights');
+  } catch (e) {
+    document.getElementById('main-content').innerHTML =
+      `<div class="empty"><h3>Failed to load</h3><p>${e.message}</p></div>`;
+  }
+}
+
+function updateHeader() {
+  if (data.info) {
+    document.getElementById('scan-path').textContent = data.info.root_path || '';
+    document.getElementById('total-size').textContent = fmt(data.info.total_size);
+  }
+}
+
+function updateSidebar() {
+  if (data.largeFiles) {
+    const total = data.largeFiles.reduce((s, f) => s + (f.disk_size || 0), 0);
+    document.getElementById('large-count').textContent = `(${data.largeFiles.length})`;
+    document.getElementById('large-size').textContent = fmt(total);
+  }
+  if (data.devArtifacts) {
+    const total = data.devArtifacts.reduce((s, d) => s + (d.disk_size || 0), 0);
+    document.getElementById('dev-count').textContent = `(${data.devArtifacts.length})`;
+    document.getElementById('dev-size').textContent = fmt(total);
+  }
+  if (data.oldFiles) {
+    const total = data.oldFiles.reduce((s, f) => s + (f.disk_size || 0), 0);
+    document.getElementById('old-count').textContent = `(${data.oldFiles.length})`;
+    document.getElementById('old-size').textContent = fmt(total);
+  }
+}
+
+// --- Views ---
+function showView(view) {
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === view));
+  const main = document.getElementById('main-content');
+
+  switch (view) {
+    case 'insights': main.innerHTML = renderInsights(); break;
+    case 'overview': main.innerHTML = renderTree(); break;
+    case 'large-files': main.innerHTML = renderFileList(data.largeFiles, 'Large Files', 'safe'); break;
+    case 'dev-artifacts': main.innerHTML = renderDevArtifacts(); break;
+    case 'old-files': main.innerHTML = renderFileList(data.oldFiles, 'Old Files (1yr+)', 'review'); break;
+  }
+}
+
+function renderInsights() {
+  const insights = data.insights;
+  if (!insights || !insights.content) {
+    return `<div class="insights">
+      <h2>AI Insights <span class="badge">AI</span></h2>
+      <div class="insights-content">No AI insights available. Run this from Claude Code to get personalized analysis.</div>
+    </div>` + renderQuickSummary();
+  }
+  return `<div class="insights">
+    <h2>AI Insights <span class="badge">AI</span></h2>
+    <div class="insights-content">${escapeHtml(insights.content)}</div>
+  </div>` + renderQuickSummary();
+}
+
+function renderQuickSummary() {
+  if (!data.summary) return '';
+  const s = data.summary;
+  const devTotal = (data.devArtifacts || []).reduce((a, d) => a + (d.disk_size || 0), 0);
+  return `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:20px;">
+      <div style="background:var(--surface);padding:16px;border-radius:8px;">
+        <div style="font-size:24px;font-weight:700;">${fmt(s.total_size)}</div>
+        <div style="font-size:12px;color:var(--text2);">Total scanned</div>
+      </div>
+      <div style="background:var(--surface);padding:16px;border-radius:8px;">
+        <div style="font-size:24px;font-weight:700;color:var(--yellow);">${fmt(s.potential_savings)}</div>
+        <div style="font-size:12px;color:var(--text2);">Potential savings</div>
+      </div>
+      <div style="background:var(--surface);padding:16px;border-radius:8px;">
+        <div style="font-size:24px;font-weight:700;color:var(--green);">${fmt(devTotal)}</div>
+        <div style="font-size:12px;color:var(--text2);">Dev artifacts (safe)</div>
+      </div>
+      <div style="background:var(--surface);padding:16px;border-radius:8px;">
+        <div style="font-size:24px;font-weight:700;">${s.total_files.toLocaleString()}</div>
+        <div style="font-size:12px;color:var(--text2);">Files scanned</div>
+      </div>
+    </div>`;
+}
+
+function renderTree() {
+  if (!data.tree || !data.tree.children) return '<div class="empty"><h3>No tree data</h3></div>';
+  const rootSize = data.tree.disk_size || 1;
+  let html = `<div class="section-header"><h2>Directory Overview</h2></div>`;
+  html += '<div style="display:flex;flex-direction:column;gap:4px;">';
+  for (const child of data.tree.children) {
+    const ratio = child.disk_size / rootSize;
+    html += `<div class="tree-item">
+      <span class="tree-icon">${child.is_dir ? '\uD83D\uDCC1' : '\uD83D\uDCC4'}</span>
+      <span class="tree-name">${escapeHtml(child.name)}</span>
+      <span class="tree-size">${fmt(child.disk_size)} (${pct(child.disk_size, rootSize)}%)</span>
+      <div class="tree-bar"><div class="tree-bar-fill" style="width:${Math.max(1, ratio*100)}%;background:${barColor(ratio)}"></div></div>
+    </div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function renderFileList(files, title, tagType) {
+  if (!files || files.length === 0) return `<div class="empty"><h3>No ${title.toLowerCase()}</h3></div>`;
+  const maxSize = Math.max(...files.map(f => f.disk_size || 0));
+  const tag = tagType === 'safe' ? '<span class="tag tag-safe">safe to delete</span>'
+            : tagType === 'review' ? '<span class="tag tag-review">review</span>'
+            : '';
+
+  let html = `<div class="section-header"><h2>${title}</h2>
+    <button class="select-all" onclick="selectAll('${title}')">Select all safe</button></div>`;
+  html += '<div class="item-list">';
+  for (const f of files) {
+    const ratio = maxSize > 0 ? f.disk_size / maxSize : 0;
+    const checked = selected.has(f.full_path) ? 'checked' : '';
+    const selClass = selected.has(f.full_path) ? 'selected' : '';
+    html += `<div class="item ${selClass}">
+      <input type="checkbox" ${checked} onchange="toggleItem('${escapeAttr(f.full_path)}', ${f.disk_size}, this)">
+      <div class="item-info">
+        <div class="item-name">${escapeHtml(f.name)}</div>
+        <div class="item-path">${escapeHtml(f.full_path)}</div>
+      </div>
+      ${tag}
+      <span class="item-size">${fmt(f.disk_size)}</span>
+      <div class="item-bar"><div class="item-bar-fill" style="width:${Math.max(2,ratio*100)}%;background:${barColor(ratio)}"></div></div>
+    </div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function renderDevArtifacts() {
+  if (!data.devArtifacts || data.devArtifacts.length === 0)
+    return '<div class="empty"><h3>No dev artifacts found</h3></div>';
+  const maxSize = Math.max(...data.devArtifacts.map(d => d.disk_size || 0));
+  let html = `<div class="section-header"><h2>Dev Artifacts</h2>
+    <button class="select-all" onclick="selectAllDev()">Select all</button></div>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:16px;">
+      Build caches and dependency folders. These are regenerated by <code>npm install</code>,
+      <code>cargo build</code>, etc. Always safe to delete.
+    </p>`;
+  html += '<div class="item-list">';
+  for (const d of data.devArtifacts) {
+    const ratio = maxSize > 0 ? d.disk_size / maxSize : 0;
+    const path = d.full_path || d.name;
+    const checked = selected.has(path) ? 'checked' : '';
+    const selClass = selected.has(path) ? 'selected' : '';
+    html += `<div class="item ${selClass}">
+      <input type="checkbox" ${checked} onchange="toggleItem('${escapeAttr(path)}', ${d.disk_size}, this)">
+      <div class="item-info">
+        <div class="item-name">${escapeHtml(d.name)}</div>
+        <div class="item-path">${escapeHtml(path)}</div>
+      </div>
+      <span class="tag tag-safe">safe</span>
+      <span class="item-size">${fmt(d.disk_size)}</span>
+      <div class="item-bar"><div class="item-bar-fill" style="width:${Math.max(2,ratio*100)}%;background:var(--green)"></div></div>
+    </div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function selectAllDev() {
+  data.devArtifacts.forEach(d => {
+    const path = d.full_path || d.name;
+    selected.set(path, d.disk_size);
+  });
+  updateSelection();
+  showView('dev-artifacts');
+}
+
+function selectAll(title) {
+  const files = title === 'Large Files' ? data.largeFiles : data.oldFiles;
+  files.forEach(f => selected.set(f.full_path, f.disk_size));
+  updateSelection();
+  showView(title === 'Large Files' ? 'large-files' : 'old-files');
+}
+
+async function trashSelected() {
+  // Build confirmation message
+  const items = [...selected.entries()];
+  let totalSize = 0;
+  items.forEach(([_, s]) => totalSize += s);
+
+  const names = items.slice(0, 5).map(([p]) => '  ' + p.split('/').pop()).join('\n');
+  const extra = items.length > 5 ? `\n  ... and ${items.length - 5} more` : '';
+  const msg = `Move ${items.length} item(s) to Trash? (${fmt(totalSize)})\n\n${names}${extra}\n\nFiles go to macOS Trash and can be restored.`;
+
+  if (!confirm(msg)) return;
+
+  const btn = document.getElementById('btn-trash');
+  btn.disabled = true;
+  btn.textContent = 'Moving to Trash...';
+
+  let freed = 0, failed = 0;
+  for (const [path, size] of selected) {
+    try {
+      const res = await fetch(API + '/api/trash', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${AUTH_TOKEN}`,
+        },
+        body: JSON.stringify({ path }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        freed += result.size_freed || size;
+        selected.delete(path);
+      } else {
+        failed++;
+        toast(`Failed: ${result.error || path}`, 'error');
+      }
+    } catch (e) {
+      failed++;
+      toast(`Error: ${e.message}`, 'error');
+    }
+  }
+
+  if (freed > 0) toast(`Moved ${fmt(freed)} to Trash`);
+  if (failed > 0) toast(`${failed} items failed`, 'error');
+
+  btn.disabled = false;
+  btn.textContent = 'Move to Trash';
+  updateSelection();
+
+  // Refresh data
+  await loadAll();
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function escapeAttr(s) {
+  if (!s) return '';
+  return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+}
+
+// --- Init ---
+document.querySelectorAll('.nav-item').forEach(n => {
+  n.addEventListener('click', () => showView(n.dataset.view));
+});
+
+loadAll();
+</script>
+</body>
+</html>

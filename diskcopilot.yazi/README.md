@@ -1,6 +1,6 @@
 # diskcopilot.yazi
 
-Yazi plugin for disk scanning and analytics powered by [diskcopilot](https://github.com/user/diskcopilot-cli).
+Yazi plugin for disk scanning and analytics powered by [diskcopilot-cli](https://github.com/bluedusk/diskcopilot-cli).
 
 ## Requirements
 

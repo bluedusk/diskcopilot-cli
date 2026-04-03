@@ -1,5 +1,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use std::collections::HashMap;
+use std::io::Read as IoRead;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Output types
@@ -379,6 +382,141 @@ pub fn query_dev_artifacts(conn: &Connection) -> Result<Vec<TreeNode>> {
 }
 
 // ---------------------------------------------------------------------------
+// Duplicate detection
+// ---------------------------------------------------------------------------
+
+/// A group of files that share identical content (same blake3 hash).
+#[derive(Debug, Clone)]
+pub struct DuplicateGroup {
+    pub hash: String,
+    pub size: u64,
+    pub count: usize,
+    pub file_ids: Vec<i64>,
+}
+
+/// Hash a file at `path` using blake3, reading in 64 KB chunks.
+/// Returns the hex-encoded hash string.
+fn hash_file(path: &Path) -> Result<String> {
+    const BUF_SIZE: usize = 64 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; BUF_SIZE];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Find duplicate files by content.
+///
+/// 1. Queries the DB for files where at least two entries share the same
+///    `disk_size` (size-based candidates).
+/// 2. For each candidate, reconstructs its full path, hashes the real file,
+///    and updates `content_hash` in the DB.
+/// 3. Calls `on_progress(hashed_count, total_candidates)` after each file.
+/// 4. Groups candidates by `content_hash` where count > 1, sorted by size
+///    descending.
+pub fn find_duplicates(
+    conn: &Connection,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<Vec<DuplicateGroup>> {
+    // Step 1: find candidate file ids (files sharing disk_size with >= 1 other)
+    let candidates: Vec<(i64, i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.dir_id, f.disk_size
+             FROM files f
+             WHERE f.disk_size IN (
+                 SELECT disk_size FROM files
+                 GROUP BY disk_size
+                 HAVING COUNT(*) > 1
+             )
+             ORDER BY f.disk_size DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let total = candidates.len();
+
+    // Step 2: hash each candidate and update the DB
+    for (idx, (file_id, dir_id, _disk_size)) in candidates.iter().enumerate() {
+        // Reconstruct the name for this file
+        let name: String = conn.query_row(
+            "SELECT name FROM files WHERE id = ?1",
+            rusqlite::params![file_id],
+            |row| row.get(0),
+        )?;
+        let dir_path = reconstruct_path(conn, *dir_id)?;
+        let full_path = format!("{}/{}", dir_path, name);
+
+        // Hash the actual file (ignore if it can't be read)
+        if let Ok(hash) = hash_file(Path::new(&full_path)) {
+            conn.execute(
+                "UPDATE files SET content_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, file_id],
+            )?;
+        }
+
+        on_progress(idx + 1, total);
+    }
+
+    // Step 3: group by content_hash where count > 1
+    let rows: Vec<(String, i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT content_hash, disk_size, id
+             FROM files
+             WHERE content_hash IS NOT NULL
+             ORDER BY disk_size DESC, content_hash",
+        )?;
+        let iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        iter.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Aggregate into groups, preserving size-desc order from SQL
+    let mut map: HashMap<String, (u64, Vec<i64>)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (hash, size, id) in rows {
+        let entry = map.entry(hash.clone()).or_insert_with(|| {
+            order.push(hash.clone());
+            (size as u64, Vec::<i64>::new())
+        });
+        entry.1.push(id);
+    }
+
+    let mut result: Vec<DuplicateGroup> = map
+        .into_iter()
+        .filter(|(_, (_, ids))| ids.len() > 1)
+        .map(|(hash, (size, file_ids))| DuplicateGroup {
+            count: file_ids.len(),
+            hash,
+            size,
+            file_ids,
+        })
+        .collect();
+
+    // Sort by size descending
+    result.sort_by(|a, b| b.size.cmp(&a.size));
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -387,6 +525,7 @@ mod tests {
     use super::*;
     use crate::cache::schema::{create_tables, open_memory_db};
     use crate::cache::writer::{CacheWriter, DirEntry, FileEntry};
+    use std::io::Write;
 
     /// Build the shared test DB:
     ///   home/ (id=1)  ← root
@@ -563,6 +702,108 @@ mod tests {
 
         let path = reconstruct_path(&conn, 3)?;
         assert_eq!(path, "home/projects/node_modules");
+        Ok(())
+    }
+
+    /// Sets up a DB whose file paths point to real temp files so that
+    /// find_duplicates can hash them.
+    #[test]
+    fn test_find_duplicates_detects_identical_files() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let tmp_path = tmp.path().to_string_lossy().into_owned();
+
+        // Write three files: two with identical content, one unique.
+        let dup_content = b"hello duplicate world";
+        let unique_content = b"this is unique content 12345";
+
+        let file_a = tmp.path().join("file_a.txt");
+        let file_b = tmp.path().join("file_b.txt");
+        let file_c = tmp.path().join("file_c.txt");
+        std::fs::File::create(&file_a)?.write_all(dup_content)?;
+        std::fs::File::create(&file_b)?.write_all(dup_content)?;
+        std::fs::File::create(&file_c)?.write_all(unique_content)?;
+
+        let dup_size = dup_content.len() as i64;
+        let unique_size = unique_content.len() as i64;
+
+        // Build an in-memory DB where dir name == tmp_path so that
+        // reconstruct_path(dir_id) + "/" + name gives the correct absolute path.
+        let conn = open_memory_db()?;
+        create_tables(&conn)?;
+        let mut conn = conn;
+
+        {
+            let mut w = CacheWriter::new(&mut conn, 100);
+
+            // Root dir whose name IS the tmp path (no parent → reconstruct
+            // returns just that single segment, giving "<tmp_path>/file_x.txt")
+            w.add_dir(DirEntry {
+                id: 1,
+                parent_id: None,
+                name: tmp_path.clone(),
+                created_at: None,
+                modified_at: None,
+            })?;
+
+            w.add_file(FileEntry {
+                id: 1,
+                dir_id: 1,
+                name: "file_a.txt".into(),
+                logical_size: dup_size,
+                disk_size: dup_size,
+                created_at: None,
+                modified_at: None,
+                extension: Some("txt".into()),
+                inode: None,
+                content_hash: None,
+            })?;
+            w.add_file(FileEntry {
+                id: 2,
+                dir_id: 1,
+                name: "file_b.txt".into(),
+                logical_size: dup_size,
+                disk_size: dup_size,
+                created_at: None,
+                modified_at: None,
+                extension: Some("txt".into()),
+                inode: None,
+                content_hash: None,
+            })?;
+            w.add_file(FileEntry {
+                id: 3,
+                dir_id: 1,
+                name: "file_c.txt".into(),
+                logical_size: unique_size,
+                disk_size: unique_size,
+                created_at: None,
+                modified_at: None,
+                extension: Some("txt".into()),
+                inode: None,
+                content_hash: None,
+            })?;
+
+            w.finalize()?;
+        }
+
+        let mut progress_calls = Vec::new();
+        let groups = find_duplicates(&conn, |done, total| {
+            progress_calls.push((done, total));
+        })?;
+
+        // file_c is unique (no size-sibling), so only file_a + file_b are candidates
+        assert_eq!(progress_calls.len(), 2, "expected 2 progress calls");
+        assert_eq!(progress_calls.last(), Some(&(2, 2)));
+
+        // Exactly one duplicate group
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.count, 2);
+        assert_eq!(g.size, dup_size as u64);
+        assert!(g.file_ids.contains(&1));
+        assert!(g.file_ids.contains(&2));
+
         Ok(())
     }
 }

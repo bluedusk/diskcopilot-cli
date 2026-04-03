@@ -93,17 +93,21 @@ pub fn scan_directory(
     progress: &ScanProgress,
 ) -> Result<()> {
     // Collect all entries from the parallel walk first.
-    let entries: Vec<_> = WalkDir::new(root)
+    let mut entries: Vec<_> = WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .collect();
 
+    // Sort by depth (path component count) so parents are always
+    // processed before children. jwalk's parallel walk does NOT
+    // guarantee parent-before-child order.
+    entries.sort_by_key(|e| e.path().components().count());
+
     // ------------------------------------------------------------------
-    // First pass: assign directory IDs in walk order so parents always
-    // get a lower ID than their children (jwalk yields parent before
-    // children in depth-first order).
+    // First pass: assign directory IDs in depth order so parents always
+    // get a lower ID than their children.
     // ------------------------------------------------------------------
     let mut dir_id_counter: i64 = 0;
     // Maps canonical PathBuf → dir_id

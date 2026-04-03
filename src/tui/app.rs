@@ -149,6 +149,9 @@ pub struct App {
     /// Pending delete confirmation: holds (item_index, full_path) being confirmed
     pub confirm_delete: Option<(usize, String)>,
 
+    /// Status message shown in the status bar (e.g. error from delete)
+    pub status_message: Option<String>,
+
     /// Set of marked item indices (for multi-select)
     pub marked: HashSet<usize>,
 
@@ -184,6 +187,7 @@ impl App {
             visible_items: Vec::new(),
             list_items: Vec::new(),
             confirm_delete: None,
+            status_message: None,
             marked: HashSet::new(),
             root_path: String::new(),
             scan_meta: None,
@@ -357,19 +361,44 @@ fn sort_nodes(nodes: &mut Vec<TreeNode>, mode: SortMode) {
 // ---------------------------------------------------------------------------
 
 pub fn handle_key(app: &mut App, key: KeyEvent, conn: &Connection) -> Result<()> {
+    // Clear status message on any key press
+    app.status_message = None;
+
     // Handle confirmation dialog first
     if let Some((_, ref full_path)) = app.confirm_delete.clone() {
         match key.code {
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 // Permanent delete
-                let _ = delete_permanent(full_path);
+                match delete_permanent(full_path) {
+                    Ok(result) if !result.success => {
+                        app.status_message = Some(format!(
+                            "Delete failed: {}",
+                            result.error.unwrap_or_else(|| "unknown error".into())
+                        ));
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Delete failed: {}", e));
+                    }
+                    _ => {}
+                }
                 app.confirm_delete = None;
                 app.load_from_cache(conn)?;
                 app.rebuild_visible(conn)?;
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 // Move to trash
-                let _ = move_to_trash(full_path);
+                match move_to_trash(full_path) {
+                    Ok(result) if !result.success => {
+                        app.status_message = Some(format!(
+                            "Trash failed: {}",
+                            result.error.unwrap_or_else(|| "unknown error".into())
+                        ));
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Trash failed: {}", e));
+                    }
+                    _ => {}
+                }
                 app.confirm_delete = None;
                 app.load_from_cache(conn)?;
                 app.rebuild_visible(conn)?;
@@ -498,10 +527,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, conn: &Connection) -> Result<()>
                         reconstruct_path(conn, item.node.id).ok()
                     } else {
                         // For files: reconstruct parent dir path, then append filename
-                        // Files are stored under a parent dir; we need the parent's id.
-                        // The TreeNode for a file doesn't carry its dir_id directly,
-                        // so we fall back to name-only as a best-effort path.
-                        Some(item.node.name.clone())
+                        if let Some(did) = item.node.dir_id {
+                            reconstruct_path(conn, did)
+                                .ok()
+                                .map(|dir_path| format!("{}/{}", dir_path, item.node.name))
+                        } else {
+                            Some(item.node.name.clone())
+                        }
                     }
                 })
             } else {

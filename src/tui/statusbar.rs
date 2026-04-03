@@ -33,7 +33,14 @@ impl Widget for StatusBar<'_> {
 
         let style = self.app.theme.status_bar;
 
-        let line = if let Some(meta) = &self.app.scan_meta {
+        // If there is a status message (e.g. error), show it prominently
+        let line = if let Some(ref msg) = self.app.status_message {
+            use ratatui::style::{Color, Style};
+            Line::from(vec![Span::styled(
+                format!(" {}", msg),
+                Style::default().fg(Color::Red),
+            )])
+        } else if let Some(meta) = &self.app.scan_meta {
             let total_size = format_size(meta.total_size as u64);
             Line::from(vec![
                 Span::styled(

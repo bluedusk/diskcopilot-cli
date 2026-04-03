@@ -21,6 +21,9 @@ pub struct TreeNode {
     pub modified_at: Option<i64>,
     pub extension: Option<String>,
     pub children: Vec<TreeNode>,
+    /// For files: the directory ID containing this file (used to reconstruct full path).
+    /// For directories: `None` (they use their own `id`).
+    pub dir_id: Option<i64>,
 }
 
 /// A flat file row with a reconstructed full path.
@@ -108,6 +111,7 @@ pub fn load_root(conn: &Connection) -> Result<TreeNode> {
         modified_at,
         extension: None,
         children: Vec::new(),
+        dir_id: None,
     })
 }
 
@@ -134,6 +138,7 @@ pub fn load_children(conn: &Connection, dir_id: i64) -> Result<Vec<TreeNode>> {
                 modified_at: row.get(6)?,
                 extension: None,
                 children: Vec::new(),
+                dir_id: None,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -159,6 +164,7 @@ pub fn load_children(conn: &Connection, dir_id: i64) -> Result<Vec<TreeNode>> {
                 modified_at: row.get(5)?,
                 extension: row.get(6)?,
                 children: Vec::new(),
+                dir_id: Some(dir_id),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -375,6 +381,7 @@ pub fn query_dev_artifacts(conn: &Connection) -> Result<Vec<TreeNode>> {
             modified_at: row.get(6)?,
             extension: None,
             children: Vec::new(),
+            dir_id: None,
         })
     })?;
 

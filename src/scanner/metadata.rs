@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -35,8 +37,12 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<FileMeta> {
 
     // mtime is universally available via MetadataExt
     let modified_at = Some(m.mtime());
-    // ctime on macOS/Linux is the inode change time (closest to creation time
-    // available without birthtime xattr). Use it as created_at.
+
+    // On macOS, use st_birthtime (true file creation time) instead of ctime
+    // (which is inode change time, not creation time).
+    #[cfg(target_os = "macos")]
+    let created_at = Some(m.st_birthtime() as i64);
+    #[cfg(not(target_os = "macos"))]
     let created_at = Some(m.ctime());
 
     Ok(FileMeta {

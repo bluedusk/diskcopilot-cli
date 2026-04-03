@@ -70,9 +70,20 @@ enum Commands {
 async fn run_scan(
     path: PathBuf,
     full: bool,
-    _dirs_only: bool,
+    dirs_only: bool,
+    accurate: bool,
+    cross_firmlinks: bool,
     min_size: &str,
 ) -> anyhow::Result<()> {
+    if dirs_only {
+        eprintln!("Warning: --dirs-only is not yet implemented");
+    }
+    if accurate {
+        eprintln!("Warning: --accurate is not yet implemented");
+    }
+    if cross_firmlinks {
+        eprintln!("Warning: --cross-firmlinks is not yet implemented");
+    }
     // 1. Parse min_size
     let min_file_size = parse_size(min_size)?;
 
@@ -183,9 +194,19 @@ async fn main() -> anyhow::Result<()> {
             full,
             dirs_only,
             min_size,
-            ..
-        } => run_scan(path, full, dirs_only, &min_size).await,
-        Commands::Tui { path, theme, .. } => {
+            accurate,
+            cross_firmlinks,
+        } => run_scan(path, full, dirs_only, accurate, cross_firmlinks, &min_size).await,
+        Commands::Tui { path, theme, cached, depth, top, .. } => {
+            if cached {
+                eprintln!("Warning: --cached is not yet implemented");
+            }
+            if depth.is_some() {
+                eprintln!("Warning: --depth is not yet implemented");
+            }
+            if top.is_some() {
+                eprintln!("Warning: --top is not yet implemented");
+            }
             // Determine path and look for cache
             let target = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let db_path = diskcopilot::cache::db_path_for(&target)?;

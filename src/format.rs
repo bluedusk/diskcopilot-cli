@@ -18,15 +18,15 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Parse a size string like "100M", "1G", "500K" into bytes.
+/// Parse a size string like "100M", "1G", "500K", "100MB", "1GB" into bytes.
 pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
-    let (num, unit) = if s.ends_with(|c: char| c.is_alphabetic()) {
-        let split = s.len() - 1;
-        (&s[..split], &s[split..])
-    } else {
-        (s, "")
-    };
+    // Split at the boundary between digits (or '.') and trailing alphabetic characters.
+    let split_pos = s
+        .rfind(|c: char| !c.is_alphabetic())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let (num, unit) = (&s[..split_pos], &s[split_pos..]);
 
     let value: f64 = num.parse().map_err(|_| anyhow::anyhow!("invalid size: {}", s))?;
 
@@ -64,5 +64,13 @@ mod tests {
         assert_eq!(parse_size("500K").unwrap(), 512000);
         assert_eq!(parse_size("1024").unwrap(), 1024);
         assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_multi_char_units() {
+        assert_eq!(parse_size("100MB").unwrap(), 104857600);
+        assert_eq!(parse_size("1GB").unwrap(), 1073741824);
+        assert_eq!(parse_size("500KB").unwrap(), 512000);
+        assert_eq!(parse_size("2TB").unwrap(), 2 * 1024 * 1024 * 1024 * 1024);
     }
 }

@@ -1,31 +1,37 @@
 use std::path::Path;
 
-/// Known dangerous system paths that should not be scanned as roots.
-/// These are critical macOS/Unix directories where scanning could be dangerous
-/// (extremely slow, destructive operations, or system integrity risks).
-const BLOCKED_PATHS: &[&str] = &[
-    "/",
+/// System paths where the directory itself AND all its subdirectories are dangerous.
+/// Prefix matching is applied: any path under these roots is blocked.
+/// Note: "/" is not listed here because it is already caught by the component-count
+/// check (< 3 components), and including it would block every absolute path.
+const DANGEROUS_ROOTS: &[&str] = &[
     "/System",
     "/Library",
+    "/private",
+];
+
+/// Paths that are dangerous as exact scan targets but whose subdirectories may
+/// be legitimate. These are also caught by the component-count check (< 3
+/// components) but listed explicitly for documentation.
+const BLOCKED_EXACT: &[&str] = &[
     "/usr",
     "/bin",
     "/sbin",
     "/var",
-    "/private",
     "/etc",
     "/tmp",
+    "/cores",
+    "/opt",
     "/Applications",
     "/Users",
     "/Volumes",
-    "/cores",
-    "/opt",
 ];
 
 /// Returns `true` if the given path is considered dangerous to use as a scan root.
 ///
 /// A path is dangerous if:
 /// - It has fewer than 3 components (e.g., `/`, `/Users`, `/usr/bin`), OR
-/// - It exactly matches one of the known system blocklist paths.
+/// - It or any of its ancestor prefixes matches one of the known system blocklist paths.
 pub fn is_dangerous_path(path: &Path) -> bool {
     let component_count = path.components().count();
 
@@ -34,10 +40,20 @@ pub fn is_dangerous_path(path: &Path) -> bool {
         return true;
     }
 
-    // Check exact match against the blocklist
+    // Check exact match against container directories
     if let Some(path_str) = path.to_str() {
-        for &blocked in BLOCKED_PATHS {
+        for &blocked in BLOCKED_EXACT {
             if path_str == blocked {
+                return true;
+            }
+        }
+    }
+
+    // Check if any prefix of the path matches a dangerous root
+    for ancestor in path.ancestors() {
+        let ancestor_str = ancestor.to_string_lossy();
+        for &dangerous in DANGEROUS_ROOTS {
+            if ancestor_str.as_ref() == dangerous {
                 return true;
             }
         }
@@ -103,10 +119,20 @@ mod tests {
     }
 
     #[test]
-    fn test_three_component_non_blocked_is_safe() {
-        // /usr/local/bin has 3 components and isn't in the blocklist directly
-        // (though /usr is) — with exactly 3 it passes the component check
-        // but /usr/local/bin is not in the blocklist so safe:
+    fn test_subdirs_of_blocked_paths_are_dangerous() {
+        // /System/Library/CoreServices is a subdirectory of /System, which is blocked
+        assert!(is_dangerous_path(Path::new("/System/Library/CoreServices")));
+        // /Library/Application Support is under /Library
+        assert!(is_dangerous_path(Path::new("/Library/Application Support")));
+        // /private/var/db is under /private, which is a dangerous root
+        assert!(is_dangerous_path(Path::new("/private/var/db")));
+    }
+
+    #[test]
+    fn test_user_installed_paths_are_safe() {
+        // /usr/local/bin has 4 components and /usr is only exact-blocked (not prefix-blocked)
         assert!(!is_dangerous_path(Path::new("/usr/local/bin")));
+        // /var/folders is commonly used for temp files and should be safe
+        assert!(!is_dangerous_path(Path::new("/var/folders/abc")));
     }
 }

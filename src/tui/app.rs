@@ -12,9 +12,11 @@ use std::io::stdout;
 use std::time::Duration;
 use tokio::time::interval;
 
-use crate::cache::reader::{load_children, load_root, FileRow, TreeNode};
+use crate::cache::reader::{load_children, load_root, reconstruct_path, FileRow, TreeNode};
+use crate::delete::trash::{delete_permanent, move_to_trash};
 use crate::tui::{
     event::{channel, Event, EventReceiver, NEED_RENDER},
+    search::SearchState,
     theme::Theme,
 };
 
@@ -144,14 +146,17 @@ pub struct App {
     /// List items for non-tree views (LargeFiles, Recent, etc.)
     pub list_items: Vec<FileRow>,
 
-    /// Pending delete confirmation: holds the item index being confirmed
-    pub confirm_delete: Option<usize>,
+    /// Pending delete confirmation: holds (item_index, full_path) being confirmed
+    pub confirm_delete: Option<(usize, String)>,
 
     /// Set of marked item indices (for multi-select)
     pub marked: HashSet<usize>,
 
     pub root_path: String,
     pub scan_meta: Option<ScanMeta>,
+
+    /// Fuzzy search state
+    pub search: SearchState,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +187,7 @@ impl App {
             marked: HashSet::new(),
             root_path: String::new(),
             scan_meta: None,
+            search: SearchState::new(),
         }
     }
 
@@ -338,22 +344,69 @@ fn sort_nodes(nodes: &mut Vec<TreeNode>, mode: SortMode) {
 // ---------------------------------------------------------------------------
 
 pub fn handle_key(app: &mut App, key: KeyEvent, conn: &Connection) -> Result<()> {
-    // Cancel confirmation dialog first
-    if app.confirm_delete.is_some() {
+    // Handle confirmation dialog first
+    if let Some((_, ref full_path)) = app.confirm_delete.clone() {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Actual delete handled in Task 11
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                // Permanent delete
+                let _ = delete_permanent(full_path);
+                app.confirm_delete = None;
+                app.load_from_cache(conn)?;
+                app.rebuild_visible(conn)?;
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                // Move to trash
+                let _ = move_to_trash(full_path);
+                app.confirm_delete = None;
+                app.load_from_cache(conn)?;
+                app.rebuild_visible(conn)?;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 app.confirm_delete = None;
             }
-            _ => {
-                app.confirm_delete = None;
-            }
+            _ => {}
         }
         return Ok(());
     }
 
     if app.show_help {
         app.show_help = false;
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
+    // Search mode — handle all keys while search is active
+    // ------------------------------------------------------------------
+    if app.search.active {
+        match key.code {
+            KeyCode::Esc => {
+                app.search.deactivate();
+            }
+            KeyCode::Enter => {
+                // Jump to first result and close search
+                if let Some(result) = app.search.results.first() {
+                    app.cursor = result.index;
+                }
+                app.search.deactivate();
+            }
+            KeyCode::Backspace => {
+                app.search.pop_char();
+                let items = search_items(app);
+                app.search.filter(&items);
+                if let Some(result) = app.search.results.first() {
+                    app.cursor = result.index;
+                }
+            }
+            KeyCode::Char(c) => {
+                app.search.push_char(c);
+                let items = search_items(app);
+                app.search.filter(&items);
+                if let Some(result) = app.search.results.first() {
+                    app.cursor = result.index;
+                }
+            }
+            _ => {}
+        }
         return Ok(());
     }
 
@@ -425,7 +478,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent, conn: &Connection) -> Result<()>
 
         // Delete with confirmation
         KeyCode::Char('d') => {
-            app.confirm_delete = Some(app.cursor);
+            let cursor = app.cursor;
+            let full_path = if app.view == View::Tree {
+                app.visible_items.get(cursor).and_then(|item| {
+                    if item.node.is_dir {
+                        reconstruct_path(conn, item.node.id).ok()
+                    } else {
+                        // For files: reconstruct parent dir path, then append filename
+                        // Files are stored under a parent dir; we need the parent's id.
+                        // The TreeNode for a file doesn't carry its dir_id directly,
+                        // so we fall back to name-only as a best-effort path.
+                        Some(item.node.name.clone())
+                    }
+                })
+            } else {
+                app.list_items
+                    .get(cursor)
+                    .map(|row| row.full_path.clone())
+            };
+            if let Some(path) = full_path {
+                app.confirm_delete = Some((cursor, path));
+            }
         }
 
         // Sort cycle
@@ -444,9 +517,34 @@ pub fn handle_key(app: &mut App, key: KeyEvent, conn: &Connection) -> Result<()>
             app.show_help = true;
         }
 
+        // Fuzzy search
+        KeyCode::Char('/') => {
+            app.search.activate();
+        }
+
         _ => {}
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build a (index, name) slice for the current view's items
+// ---------------------------------------------------------------------------
+
+fn search_items(app: &App) -> Vec<(usize, String)> {
+    if app.view == View::Tree {
+        app.visible_items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (i, item.node.name.clone()))
+            .collect()
+    } else {
+        app.list_items
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (i, row.name.clone()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ pub mod app;
 pub mod detail;
 pub mod event;
 pub mod icons;
+pub mod search;
 pub mod statusbar;
 pub mod tabs;
 pub mod theme;
@@ -68,9 +69,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     // -----------------------------------------------------------------------
-    // Status bar
+    // Status bar / Search bar
     // -----------------------------------------------------------------------
-    frame.render_widget(StatusBar::new(app), chunks[2]);
+    if app.search.active {
+        render_search_bar(frame, app, chunks[2]);
+    } else {
+        frame.render_widget(StatusBar::new(app), chunks[2]);
+    }
 
     // -----------------------------------------------------------------------
     // Overlays
@@ -79,7 +84,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_help(frame, app);
     }
 
-    if let Some(idx) = app.confirm_delete {
+    if let Some((idx, _)) = app.confirm_delete {
         render_confirm_delete(frame, app, idx);
     }
 }
@@ -286,6 +291,48 @@ fn render_help(frame: &mut Frame, app: &App) {
 // Confirm delete overlay
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Search bar
+// ---------------------------------------------------------------------------
+
+fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let match_count = app.search.results.len();
+    let right_label = if app.search.query.is_empty() {
+        String::new()
+    } else {
+        format!("  {} match{}", match_count, if match_count == 1 { "" } else { "es" })
+    };
+
+    // Display: "/ <query>█" followed by match count on the right
+    let query_part = format!("/ {}", app.search.query);
+    let cursor_part = "█";
+
+    let search_style = Style::default().fg(Color::Yellow);
+    let count_style = Style::default().fg(Color::DarkGray);
+
+    // Fill background
+    let blank = " ".repeat(area.width as usize);
+    let bg_line = Line::from(Span::styled(blank, search_style));
+    use ratatui::widgets::Widget;
+    bg_line.render(area, frame.buffer_mut());
+
+    let line = Line::from(vec![
+        Span::styled(query_part, search_style.add_modifier(Modifier::BOLD)),
+        Span::styled(cursor_part, search_style.add_modifier(Modifier::REVERSED)),
+        Span::styled(right_label, count_style),
+    ]);
+
+    Paragraph::new(line).render(area, frame.buffer_mut());
+}
+
+// ---------------------------------------------------------------------------
+// Confirm delete overlay
+// ---------------------------------------------------------------------------
+
 fn render_confirm_delete(frame: &mut Frame, app: &App, item_idx: usize) {
     let area = frame.area();
 
@@ -302,8 +349,8 @@ fn render_confirm_delete(frame: &mut Frame, app: &App, item_idx: usize) {
             .unwrap_or("(unknown)")
     };
 
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
-    let popup_height = 7u16;
+    let popup_width = 58u16.min(area.width.saturating_sub(4));
+    let popup_height = 8u16;
     let popup_area = Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -324,13 +371,17 @@ fn render_confirm_delete(frame: &mut Frame, app: &App, item_idx: usize) {
     let confirm_text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  Move to trash: {}?", display_name),
+            format!("  Delete: {}?", display_name),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  [y] Yes    [n / Esc] Cancel",
+            "  [t] Move to Trash    [d] Delete Permanently",
             Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "  [n / Esc] Cancel",
+            Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
     ];

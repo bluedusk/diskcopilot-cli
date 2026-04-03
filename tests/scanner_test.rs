@@ -96,11 +96,13 @@ fn test_hardlink_dedup() -> anyhow::Result<()> {
         writer.finalize()?;
     }
 
-    // Only one of the two hard-linked entries should be stored
+    // Only one of the two hard-linked entries should be stored in the DB
+    let file_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
     assert_eq!(
-        progress.files(),
+        file_count,
         1,
-        "hard-linked files should be deduplicated to 1"
+        "hard-linked files should be deduplicated to 1 in DB"
     );
 
     Ok(())

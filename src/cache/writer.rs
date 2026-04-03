@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +32,7 @@ pub struct FileEntry {
     pub content_hash: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScanMeta {
     pub root_path: String,
     pub scanned_at: i64,
@@ -83,64 +84,56 @@ impl<'conn> CacheWriter<'conn> {
         Ok(())
     }
 
-    /// Insert all buffered directory entries in a single transaction.
+    /// Insert all buffered directory entries.
     pub fn flush_dirs(&mut self) -> Result<()> {
         if self.dir_buf.is_empty() {
             return Ok(());
         }
 
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO dirs (id, parent_id, name, created_at, modified_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for d in &self.dir_buf {
-                stmt.execute(rusqlite::params![
-                    d.id,
-                    d.parent_id,
-                    d.name,
-                    d.created_at,
-                    d.modified_at,
-                ])?;
-            }
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO dirs (id, parent_id, name, created_at, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for d in &self.dir_buf {
+            stmt.execute(rusqlite::params![
+                d.id, d.parent_id, d.name, d.created_at, d.modified_at,
+            ])?;
         }
-        tx.commit()?;
         self.dir_buf.clear();
         Ok(())
     }
 
-    /// Insert all buffered file entries in a single transaction.
+    /// Insert all buffered file entries.
     pub fn flush_files(&mut self) -> Result<()> {
         if self.file_buf.is_empty() {
             return Ok(());
         }
 
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO files
-                    (id, dir_id, name, logical_size, disk_size,
-                     created_at, modified_at, extension, inode, content_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for f in &self.file_buf {
-                stmt.execute(rusqlite::params![
-                    f.id,
-                    f.dir_id,
-                    f.name,
-                    f.logical_size,
-                    f.disk_size,
-                    f.created_at,
-                    f.modified_at,
-                    f.extension,
-                    f.inode,
-                    f.content_hash,
-                ])?;
-            }
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO files
+                (id, dir_id, name, logical_size, disk_size,
+                 created_at, modified_at, extension, inode, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        for f in &self.file_buf {
+            stmt.execute(rusqlite::params![
+                f.id, f.dir_id, f.name, f.logical_size, f.disk_size,
+                f.created_at, f.modified_at, f.extension, f.inode, f.content_hash,
+            ])?;
         }
-        tx.commit()?;
         self.file_buf.clear();
+        Ok(())
+    }
+
+    /// Begin a transaction for bulk inserts.
+    pub fn begin(&mut self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    /// Commit the bulk insert transaction.
+    pub fn commit(&mut self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
 
@@ -156,111 +149,102 @@ impl<'conn> CacheWriter<'conn> {
     /// 1. Set each dir's direct file_count/sizes from its own files.
     /// 2. Load dir topology, sort leaves-first, then roll up into parents.
     pub fn compute_dir_sizes(&mut self) -> Result<()> {
-        // Step 1: direct file stats per dir.
+        // Step 1: direct file stats — only update dirs that have files.
+        // Aggregate into temp table, then JOIN-update only matching dirs.
         self.conn.execute_batch(
-            "UPDATE dirs
-             SET file_count         = (SELECT COUNT(*)
-                                       FROM files WHERE files.dir_id = dirs.id),
-                 total_file_count   = (SELECT COUNT(*)
-                                       FROM files WHERE files.dir_id = dirs.id),
-                 total_logical_size = (SELECT COALESCE(SUM(logical_size), 0)
-                                       FROM files WHERE files.dir_id = dirs.id),
-                 total_disk_size    = (SELECT COALESCE(SUM(disk_size), 0)
-                                       FROM files WHERE files.dir_id = dirs.id);",
+            "CREATE TEMP TABLE dir_direct AS
+             SELECT dir_id AS id,
+                    COUNT(*) AS fc,
+                    COALESCE(SUM(logical_size), 0) AS ls,
+                    COALESCE(SUM(disk_size), 0) AS ds
+             FROM files GROUP BY dir_id;
+
+             CREATE INDEX temp.idx_dd_id ON dir_direct(id);
+
+             UPDATE dirs SET
+                file_count         = (SELECT fc FROM dir_direct WHERE dir_direct.id = dirs.id),
+                total_file_count   = (SELECT fc FROM dir_direct WHERE dir_direct.id = dirs.id),
+                total_logical_size = (SELECT ls FROM dir_direct WHERE dir_direct.id = dirs.id),
+                total_disk_size    = (SELECT ds FROM dir_direct WHERE dir_direct.id = dirs.id)
+             WHERE dirs.id IN (SELECT id FROM dir_direct);
+
+             DROP TABLE dir_direct;",
         )?;
-
-        // Step 2: load dir topology.
-        struct DirRow {
-            id: i64,
-            parent_id: Option<i64>,
-            tfc: i64,
-            tls: i64,
-            tds: i64,
-        }
-
-        let rows: Vec<DirRow> = {
+        // Step 2: load dir topology into Rust for fast rollup.
+        let rows: Vec<(i64, Option<i64>, i64, i64, i64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, parent_id, total_file_count, total_logical_size, total_disk_size
-                 FROM dirs",
+                "SELECT id, parent_id, total_file_count, total_logical_size, total_disk_size FROM dirs",
             )?;
             let result = stmt.query_map([], |row| {
-                Ok(DirRow {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    tfc: row.get(2)?,
-                    tls: row.get(3)?,
-                    tds: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
             result
         };
 
         let n = rows.len();
-
-        // Build index: id -> position in vec.
         let mut idx: HashMap<i64, usize> = HashMap::with_capacity(n);
-        let mut tfc: Vec<i64> = Vec::with_capacity(n);
-        let mut tls: Vec<i64> = Vec::with_capacity(n);
-        let mut tds: Vec<i64> = Vec::with_capacity(n);
-        let mut parents: Vec<Option<i64>> = Vec::with_capacity(n);
-        let mut ids: Vec<i64> = Vec::with_capacity(n);
+        let mut tfc = Vec::with_capacity(n);
+        let mut tls = Vec::with_capacity(n);
+        let mut tds = Vec::with_capacity(n);
+        let mut parent_idx: Vec<Option<usize>> = Vec::with_capacity(n);
+        let mut ids = Vec::with_capacity(n);
+        let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-        for (i, r) in rows.iter().enumerate() {
-            idx.insert(r.id, i);
-            tfc.push(r.tfc);
-            tls.push(r.tls);
-            tds.push(r.tds);
-            parents.push(r.parent_id);
-            ids.push(r.id);
+        for (i, &(id, _, fc, ls, ds)) in rows.iter().enumerate() {
+            idx.insert(id, i);
+            tfc.push(fc);
+            tls.push(ls);
+            tds.push(ds);
+            ids.push(id);
+            parent_idx.push(None); // filled in next pass
         }
 
-        // Compute subtree height of each node.
-        // After convergence, leaves have height=0, root has the largest value.
-        // We iterate n times to handle any ordering in the query result.
-        let mut height = vec![0usize; n];
-        for _ in 0..n {
-            for i in 0..n {
-                if let Some(pid) = parents[i] {
-                    if let Some(&pi) = idx.get(&pid) {
-                        // Parent height must exceed child height.
-                        if height[pi] <= height[i] {
-                            height[pi] = height[i] + 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by height ascending → leaves (height=0) come first, root last.
-        // This guarantees children are rolled up before their parent is processed.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| height[i]);
-
-        // Step 3: roll up leaf → parent (children processed before parents).
-        for &i in &order {
-            let (add_tfc, add_tls, add_tds) = (tfc[i], tls[i], tds[i]);
-            if let Some(pid) = parents[i] {
+        // Build parent_idx and children adjacency
+        let mut roots = Vec::new();
+        for (i, &(_, pid, _, _, _)) in rows.iter().enumerate() {
+            if let Some(pid) = pid {
                 if let Some(&pi) = idx.get(&pid) {
-                    tfc[pi] += add_tfc;
-                    tls[pi] += add_tls;
-                    tds[pi] += add_tds;
+                    parent_idx[i] = Some(pi);
+                    children_of[pi].push(i);
+                } else {
+                    roots.push(i);
                 }
+            } else {
+                roots.push(i);
             }
         }
 
-        // Step 4: persist updated totals.
+        // BFS to get depth, sort leaves-first
+        let mut depth = vec![0u16; n];
+        let mut queue: std::collections::VecDeque<usize> = roots.iter().copied().collect();
+        while let Some(node) = queue.pop_front() {
+            for &child in &children_of[node] {
+                depth[child] = depth[node] + 1;
+                queue.push_back(child);
+            }
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|a, b| depth[*b].cmp(&depth[*a]));
+
+        // Step 3: roll up (pure Rust, ~1ms for 175k dirs)
+        for &i in &order {
+            if let Some(pi) = parent_idx[i] {
+                tfc[pi] += tfc[i];
+                tls[pi] += tls[i];
+                tds[pi] += tds[i];
+            }
+        }
+
+        // Step 4: only UPDATE dirs with non-zero totals (typically ~3-5% of all dirs).
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "UPDATE dirs
-                 SET total_file_count   = ?2,
-                     total_logical_size = ?3,
-                     total_disk_size    = ?4
-                 WHERE id = ?1",
+                "UPDATE dirs SET total_file_count = ?2, total_logical_size = ?3, total_disk_size = ?4 WHERE id = ?1",
             )?;
             for i in 0..n {
-                stmt.execute(rusqlite::params![ids[i], tfc[i], tls[i], tds[i]])?;
+                if tfc[i] > 0 || tls[i] > 0 || tds[i] > 0 {
+                    stmt.execute(rusqlite::params![ids[i], tfc[i], tls[i], tds[i]])?;
+                }
             }
         }
         tx.commit()?;

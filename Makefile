@@ -1,4 +1,4 @@
-.PHONY: build test scan query install-plugin fmt lint check
+.PHONY: build test scan query install install-plugin fmt lint check
 
 build:
 	cargo build --release
@@ -14,11 +14,14 @@ lint:
 
 check: fmt lint test
 
+install: build
+	cargo install --path .
+
 scan: build
-	cargo run --release -- scan $(path)
+	cargo run --release --bin diskcopilot-cli -- scan $(path)
 
 query: build
-	cargo run --release -- query large-files $(path) --limit 20
+	cargo run --release --bin diskcopilot-cli -- query large-files $(path) --limit 20
 
 install-plugin:
 	mkdir -p ~/.config/yazi/plugins

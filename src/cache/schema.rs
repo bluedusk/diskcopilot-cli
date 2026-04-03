@@ -2,27 +2,37 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::Path;
 
-/// Opens a SQLite database at `path` with performance PRAGMAs set.
+/// Opens a SQLite database at `path` with safe PRAGMAs (synchronous=NORMAL).
 pub fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    apply_pragmas(&conn, false)?;
+    Ok(conn)
+}
+
+/// Opens a SQLite database optimized for bulk writes (synchronous=OFF).
+/// Use only for the scan/ingest path where the cache can be rebuilt.
+pub fn open_db_for_scan(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    apply_pragmas(&conn, true)?;
     Ok(conn)
 }
 
 /// Opens an in-memory SQLite database (for tests).
 pub fn open_memory_db() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
-    apply_pragmas(&conn)?;
+    apply_pragmas(&conn, true)?;
     Ok(conn)
 }
 
-fn apply_pragmas(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=OFF;
+fn apply_pragmas(conn: &Connection, bulk_write: bool) -> Result<()> {
+    let sync_mode = if bulk_write { "OFF" } else { "NORMAL" };
+    let journal = if bulk_write { "OFF" } else { "WAL" };
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode={journal};
+         PRAGMA synchronous={sync_mode};
          PRAGMA foreign_keys=ON;
          PRAGMA cache_size=-64000;",
-    )?;
+    ))?;
     Ok(())
 }
 

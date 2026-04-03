@@ -1,8 +1,9 @@
 use crate::cache::writer::{CacheWriter, DirEntry, FileEntry};
-use crate::scanner::metadata::{extract_metadata, file_extension};
+use crate::scanner::metadata::file_extension;
 use anyhow::Result;
-use jwalk::WalkDir;
+use jwalk::WalkDirGeneric;
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,17 +14,17 @@ use std::sync::Arc;
 
 /// Atomic scan progress counters — safe to share across threads / read from UI.
 pub struct ScanProgress {
-    pub files_found: Arc<AtomicU64>,
-    pub dirs_found: Arc<AtomicU64>,
-    pub total_size: Arc<AtomicU64>,
+    pub(crate) files_found: AtomicU64,
+    pub(crate) dirs_found: AtomicU64,
+    pub(crate) total_size: AtomicU64,
 }
 
 impl ScanProgress {
     pub fn new() -> Self {
         Self {
-            files_found: Arc::new(AtomicU64::new(0)),
-            dirs_found: Arc::new(AtomicU64::new(0)),
-            total_size: Arc::new(AtomicU64::new(0)),
+            files_found: AtomicU64::new(0),
+            dirs_found: AtomicU64::new(0),
+            total_size: AtomicU64::new(0),
         }
     }
 
@@ -83,132 +84,268 @@ impl Default for ScanConfig {
 ///   span device boundaries here).
 /// - Symlinks are skipped (`follow_links(false)` is the default).
 /// - The caller is responsible for calling `writer.finalize()` afterward.
+// Per-file metadata computed in parallel on jwalk's rayon thread pool.
+// Stored in entry.client_state to avoid a second stat() on the main thread.
+#[derive(Debug, Clone, Default)]
+struct FileStat {
+    logical_size: u64,
+    disk_size: u64,
+    created_at: Option<i64>,
+    modified_at: Option<i64>,
+    inode: u64,
+}
+
 pub fn scan_directory(
     root: &Path,
     config: &ScanConfig,
     writer: &mut CacheWriter<'_>,
     progress: &ScanProgress,
 ) -> Result<()> {
-    // Collect all entries from the parallel walk first.
-    let entries: Vec<_> = WalkDir::new(root)
+    let min_file_size = config.min_file_size;
+    let full = config.full;
+
+    // Detect root filesystem device to skip cross-device mounts
+    // (network shares, USB drives, Time Machine volumes)
+    let root_dev: u64 = root.metadata().map(|m| m.dev()).unwrap_or(0);
+
+    // macOS bundle extensions — treated as opaque files, not descended into
+    const BUNDLE_EXTS: &[&str] = &[".app", ".framework", ".bundle", ".plugin", ".kext"];
+    let is_bundle = |name: &str| BUNDLE_EXTS.iter().any(|ext| name.ends_with(ext));
+
+    // Bundles found in process_read_dir (parallel) are collected here
+    // and merged as file entries after the walk.
+    // Tuple: (parent_path, name, disk_size, logical_size)
+    type BundleVec = Vec<(PathBuf, String, u64, u64)>;
+    let bundles: Arc<std::sync::Mutex<BundleVec>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let bundles_ref = bundles.clone();
+
+    // Phase 1: parallel stat via process_read_dir.
+    // File metadata (stat syscall) is computed on jwalk's rayon thread pool,
+    // parallelising millions of stat() calls across all cores.
+    let walker = WalkDirGeneric::<((), FileStat)>::new(root)
         .skip_hidden(false)
         .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .collect();
+        .process_read_dir(move |_depth, _path, _state, children| {
+            children.retain_mut(|entry_result| {
+                let Ok(entry) = entry_result else { return false };
 
-    // ------------------------------------------------------------------
-    // First pass: assign directory IDs in depth order so parents always
-    // get a lower ID than their children.
-    // ------------------------------------------------------------------
-    let mut dir_id_counter: i64 = 0;
-    // Maps canonical PathBuf → dir_id
-    let mut path_to_dir_id: HashMap<PathBuf, i64> = HashMap::new();
+                // Drop symlinks
+                if entry.file_type.is_symlink() {
+                    return false;
+                }
 
-    // First pass: directories only
-    for entry in &entries {
-        let file_type = entry.file_type();
-        if !file_type.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let meta = match extract_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+                if entry.file_type.is_dir() {
+                    let p = entry.path();
 
-        dir_id_counter += 1;
-        let dir_id = dir_id_counter;
-        path_to_dir_id.insert(path.clone(), dir_id);
+                    // APFS firmlink exclusions — prevent double-counting
+                    const EXCLUDED: &[&str] = &[
+                        "/System/Volumes/Data",
+                        "/System/Volumes/Update/mnt1",
+                        "/System/Volumes/Update/SFR/mnt1",
+                    ];
+                    if EXCLUDED.iter().any(|ex| p == Path::new(ex)) {
+                        return false;
+                    }
 
-        // Find parent dir_id
-        let parent_id = path
-            .parent()
-            .and_then(|p| path_to_dir_id.get(p))
-            .copied();
+                    // Skip cross-device mounts (network, USB, Time Machine)
+                    if root_dev != 0 {
+                        if let Ok(m) = p.metadata() {
+                            if m.dev() != root_dev {
+                                return false;
+                            }
+                        }
+                    }
 
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    // macOS bundles (.app, .framework, etc.) — compute their
+                    // total size on this parallel thread, then remove from walk
+                    // so jwalk doesn't descend. Collected into shared vec and
+                    // merged as file entries after the walk.
+                    let name = entry.file_name.to_string_lossy();
+                    if is_bundle(&name) {
+                        let mut total_disk: u64 = 0;
+                        let mut total_logical: u64 = 0;
+                        for e in jwalk::WalkDir::new(&p).skip_hidden(false).follow_links(false).into_iter().flatten() {
+                            if !e.file_type().is_dir() {
+                                if let Ok(m) = e.path().symlink_metadata() {
+                                    total_disk += m.blocks() * 512;
+                                    total_logical += m.len();
+                                }
+                            }
+                        }
+                        if let Ok(mut b) = bundles_ref.lock() {
+                            b.push((
+                                entry.parent_path.to_path_buf(),
+                                name.into_owned(),
+                                total_disk,
+                                total_logical,
+                            ));
+                        }
+                        return false; // remove from walk — don't descend
+                    }
+                } else {
+                    // File: stat() on this parallel thread
+                    let stat = match entry.path().symlink_metadata() {
+                        Ok(m) => {
+                            #[cfg(target_os = "macos")]
+                            let created_at = {
+                                use std::os::darwin::fs::MetadataExt as DarwinExt;
+                                Some(m.st_birthtime())
+                            };
+                            #[cfg(not(target_os = "macos"))]
+                            let created_at = Some(m.ctime());
 
-        writer.add_dir(DirEntry {
-            id: dir_id,
-            parent_id,
-            name,
-            created_at: meta.created_at,
-            modified_at: meta.modified_at,
-        })?;
+                            FileStat {
+                                logical_size: m.len(),
+                                disk_size: m.blocks() * 512,
+                                created_at,
+                                modified_at: Some(m.mtime()),
+                                inode: m.ino(),
+                            }
+                        }
+                        Err(_) => return false,
+                    };
 
-        progress.dirs_found.fetch_add(1, Ordering::Relaxed);
+                    // Skip small files early (in parallel) if not full mode
+                    if !full && stat.logical_size < min_file_size {
+                        return false;
+                    }
+
+                    entry.client_state = stat;
+                }
+
+                true
+            });
+        });
+
+    // Phase 2: drain walker — buffer dirs in memory, write files inline.
+    // Dir records are stored in a Vec (not written to DB yet) so we can
+    // prune the 66% that are empty leaves before hitting SQLite.
+    struct DirRecord {
+        id: i64,
+        parent_idx: Option<usize>, // index into dir_records
+        name: String,
     }
-
-    // ------------------------------------------------------------------
-    // Second pass: files (non-dirs, non-symlinks)
-    // ------------------------------------------------------------------
+    let mut dir_records: Vec<DirRecord> = Vec::new();
+    let mut path_to_idx: HashMap<PathBuf, usize> = HashMap::new();
+    let mut path_to_dir_id: HashMap<PathBuf, i64> = HashMap::new();
+    let mut dir_id_counter: i64 = 0;
     let mut seen_inodes: HashSet<u64> = HashSet::new();
     let mut file_id_counter: i64 = 0;
 
-    for entry in &entries {
-        let file_type = entry.file_type();
+    // Track which dirs contain files (directly or via ancestors)
+    let mut needed_dirs: HashSet<usize> = HashSet::new();
 
-        // Skip directories (already handled) and symlinks
-        if file_type.is_dir() || file_type.is_symlink() {
-            continue;
+    for entry in walker.into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_dir() {
+            let path = entry.path();
+            dir_id_counter += 1;
+            let dir_id = dir_id_counter;
+            let idx = dir_records.len();
+
+            let parent_idx = path.parent().and_then(|p| path_to_idx.get(p)).copied();
+
+            let name = if parent_idx.is_none() {
+                path.to_string_lossy().into_owned()
+            } else {
+                entry.file_name().to_string_lossy().into_owned()
+            };
+
+            path_to_dir_id.insert(path.clone(), dir_id);
+            path_to_idx.insert(path, idx);
+            dir_records.push(DirRecord { id: dir_id, parent_idx, name });
+
+            progress.dirs_found.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let stat = &entry.client_state;
+
+            if !seen_inodes.insert(stat.inode) {
+                continue;
+            }
+
+            let parent_path = entry.parent_path();
+            let dir_id = match path_to_dir_id.get(parent_path) {
+                Some(&id) => id,
+                None => continue,
+            };
+
+            // Mark this dir and all ancestors as needed
+            if let Some(&idx) = path_to_idx.get(parent_path) {
+                let mut cur = Some(idx);
+                while let Some(i) = cur {
+                    if !needed_dirs.insert(i) { break; } // already marked
+                    cur = dir_records[i].parent_idx;
+                }
+            }
+
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ext = file_extension(&name);
+
+            file_id_counter += 1;
+            writer.add_file(FileEntry {
+                id: file_id_counter,
+                dir_id,
+                name,
+                logical_size: stat.logical_size as i64,
+                disk_size: stat.disk_size as i64,
+                created_at: stat.created_at,
+                modified_at: stat.modified_at,
+                extension: ext,
+                inode: Some(stat.inode as i64),
+                content_hash: None,
+            })?;
+
+            progress.files_found.fetch_add(1, Ordering::Relaxed);
+            progress.total_size.fetch_add(stat.disk_size, Ordering::Relaxed);
         }
+    }
 
-        let path = entry.path();
-        let meta = match extract_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Deduplicate hard links by inode
-        if !seen_inodes.insert(meta.inode) {
-            continue;
-        }
-
-        // Size filter (skip if not full mode and below threshold)
-        if !config.full && meta.logical_size < config.min_file_size {
-            continue;
-        }
-
-        // Find the containing directory
-        let parent_path = match path.parent() {
-            Some(p) => p,
+    // Merge bundles
+    let bundles = std::mem::take(&mut *bundles.lock().unwrap());
+    for (parent_path, name, disk_size, logical_size) in bundles {
+        let dir_id = match path_to_dir_id.get(&parent_path) {
+            Some(&id) => id,
             None => continue,
         };
-        let dir_id = match path_to_dir_id.get(parent_path) {
-            Some(&id) => id,
-            None => continue, // parent wasn't recorded (permission error, etc.)
-        };
-
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
-
+        if let Some(&idx) = path_to_idx.get(&parent_path) {
+            let mut cur = Some(idx);
+            while let Some(i) = cur {
+                if !needed_dirs.insert(i) { break; }
+                cur = dir_records[i].parent_idx;
+            }
+        }
         let ext = file_extension(&name);
-
         file_id_counter += 1;
-
         writer.add_file(FileEntry {
             id: file_id_counter,
             dir_id,
             name,
-            logical_size: meta.logical_size as i64,
-            disk_size: meta.disk_size as i64,
-            created_at: meta.created_at,
-            modified_at: meta.modified_at,
+            logical_size: logical_size as i64,
+            disk_size: disk_size as i64,
+            created_at: None,
+            modified_at: None,
             extension: ext,
-            inode: Some(meta.inode as i64),
+            inode: None,
             content_hash: None,
         })?;
-
         progress.files_found.fetch_add(1, Ordering::Relaxed);
-        progress
-            .total_size
-            .fetch_add(meta.disk_size, Ordering::Relaxed);
+        progress.total_size.fetch_add(disk_size, Ordering::Relaxed);
+    }
+
+    // Write only dirs that contain files (directly or via descendants)
+    for (idx, d) in dir_records.iter().enumerate() {
+        if !needed_dirs.contains(&idx) {
+            continue;
+        }
+        let parent_id = d.parent_idx
+            .map(|pi| dir_records[pi].id);
+        writer.add_dir(DirEntry {
+            id: d.id,
+            parent_id,
+            name: d.name.clone(),
+            created_at: None,
+            modified_at: None,
+        })?;
     }
 
     Ok(())
@@ -315,7 +452,8 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM dirs", [], |r| r.get(0))?;
         let file_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-        assert_eq!(dir_count, 1);
+        // Empty dirs are pruned from DB (optimization: skip dirs with no files)
+        assert_eq!(dir_count, 0);
         assert_eq!(file_count, 0);
 
         Ok(())

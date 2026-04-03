@@ -5,7 +5,7 @@ edition = "2021"
 description = "Fast, accurate Mac disk scanner and query tool"
 
 [[bin]]
-name = "diskcopilot"
+name = "diskcopilot-cli"
 path = "src/main.rs"
 
 [lib]
@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["full"] }
 
 # Scanning
 jwalk = "0.8"
+rayon = "1"
+crossbeam-channel = "0.5"
 
 # Cache
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -31,6 +33,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Utils
+libc = "0.2"
 dirs = "5"
 indicatif = "0.17"
 blake3 = "1"

@@ -43,13 +43,9 @@ fn test_scan_and_read_roundtrip() -> anyhow::Result<()> {
 
     // --- load_root ---
     let root_node = load_root(&conn)?;
-    // The root name should be the directory name (last component of the temp path)
-    let expected_root_name = root
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(root_node.name, expected_root_name, "root name should match temp dir name");
+    // The root name should be the absolute path (used for path reconstruction)
+    let expected_root_name = root.to_string_lossy().into_owned();
+    assert_eq!(root_node.name, expected_root_name, "root name should be absolute path");
     assert!(root_node.is_dir);
 
     // --- load_children of root ---

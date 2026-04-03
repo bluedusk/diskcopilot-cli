@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+pub use crate::cache::writer::ScanMeta;
+
 // ---------------------------------------------------------------------------
 // Output types
 // ---------------------------------------------------------------------------
@@ -45,17 +47,6 @@ pub struct FileRow {
     pub modified_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<String>,
-}
-
-/// Metadata written at the end of a scan.
-#[derive(Debug, Clone, Serialize)]
-pub struct ScanMeta {
-    pub root_path: String,
-    pub scanned_at: i64,
-    pub total_files: i64,
-    pub total_dirs: i64,
-    pub total_size: i64,
-    pub scan_duration_ms: i64,
 }
 
 pub fn load_scan_meta(conn: &Connection) -> Result<Option<ScanMeta>> {
@@ -668,7 +659,11 @@ pub fn find_duplicates(
 
     let total = candidates.len();
 
-    // Step 2: hash each candidate and update the DB
+    // Step 2: batch-resolve all dir_ids → paths in one recursive CTE query.
+    let dir_ids: Vec<i64> = candidates.iter().map(|(_, dir_id, _)| *dir_id).collect();
+    let dir_path_map = reconstruct_paths(conn, &dir_ids)?;
+
+    // Step 3: hash each candidate and update the DB
     for (idx, (file_id, dir_id, _disk_size)) in candidates.iter().enumerate() {
         // Reconstruct the name for this file
         let name: String = conn.query_row(
@@ -676,7 +671,7 @@ pub fn find_duplicates(
             rusqlite::params![file_id],
             |row| row.get(0),
         )?;
-        let dir_path = reconstruct_path(conn, *dir_id)?;
+        let dir_path = dir_path_map.get(dir_id).cloned().unwrap_or_default();
         let full_path = format!("{}/{}", dir_path, name);
 
         // Hash the actual file (ignore if it can't be read)

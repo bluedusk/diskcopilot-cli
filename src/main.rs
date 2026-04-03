@@ -4,8 +4,10 @@ use diskcopilot::cache::reader::{
     query_by_extension, query_by_name, query_dev_artifacts, query_large_files,
     query_old_files, query_recent_files, query_summary,
 };
+use diskcopilot::cache::writer::ScanMeta;
 use diskcopilot::delete::trash::{delete_permanent, move_to_trash};
 use diskcopilot::format::{format_size, parse_size};
+use diskcopilot::scanner::safety::is_dangerous_path;
 use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
 #[cfg(target_os = "macos")]
 use diskcopilot::scanner::bulk_walker::{scan_directory_bulk, supports_bulk_attrs};
@@ -184,12 +186,7 @@ async fn run_scan(
     min_size: &str,
 ) -> anyhow::Result<()> {
     // Warn on system paths, but let --force override
-    let path_str = path.to_string_lossy();
-    let is_system = path_str == "/"
-        || path_str.starts_with("/System")
-        || path_str.starts_with("/Library")
-        || path_str.starts_with("/private");
-    if is_system && !force {
+    if is_dangerous_path(&path) && !force {
         anyhow::bail!(
             "'{}' is a system path. This may take a very long time. Use --force to proceed.",
             path.display()
@@ -260,7 +257,7 @@ async fn run_scan(
     // 6. Walk the filesystem
     // Disable FK checks during scan to allow inserting entries in any order
     // (jwalk's parallel walk does not guarantee parent-before-child ordering).
-    conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA journal_mode=OFF; PRAGMA locking_mode=EXCLUSIVE;")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA locking_mode=EXCLUSIVE;")?;
     {
         let mut cache_writer = writer::CacheWriter::new(&mut conn, 500_000);
         cache_writer.begin()?;
@@ -313,21 +310,20 @@ async fn run_scan(
     ).unwrap_or((progress.files() as i64, progress.dirs() as i64, progress.size() as i64));
 
     // Write scan metadata with accurate DB totals
-    conn.execute(
-        "INSERT INTO scan_meta (root_path, scanned_at, total_files, total_dirs, total_size, scan_duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            path.to_string_lossy().as_ref(),
-            std::time::SystemTime::now()
+    {
+        let mut meta_writer = writer::CacheWriter::new(&mut conn, 1);
+        meta_writer.write_meta(&ScanMeta {
+            root_path: path.to_string_lossy().into_owned(),
+            scanned_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64,
             total_files,
             total_dirs,
             total_size,
-            elapsed.as_millis() as i64,
-        ],
-    )?;
+            scan_duration_ms: elapsed.as_millis() as i64,
+        })?;
+    }
 
     let files = total_files as u64;
     let dirs = total_dirs as u64;

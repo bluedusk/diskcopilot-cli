@@ -36,6 +36,7 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Loads config from `~/.diskcopilot/config.toml`, falling back to defaults if not found.
+// TODO: wire up config loading — currently unused; main.rs uses hardcoded defaults
 pub fn load_config() -> Result<Config> {
     let path = config_path();
     if !path.exists() {

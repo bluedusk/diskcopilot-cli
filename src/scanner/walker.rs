@@ -55,9 +55,7 @@ pub struct ScanConfig {
     /// Minimum file size (in bytes) to cache. Files smaller than this are
     /// skipped unless `full` is true. Defaults to 1 MiB.
     pub min_file_size: u64,
-    /// When true, cache every file regardless of size.
-    pub cache_files: bool,
-    /// When true, apply no size filter (equivalent to min_file_size=0 + cache_files=true).
+    /// When true, apply no size filter (equivalent to min_file_size=0).
     pub full: bool,
 }
 
@@ -65,7 +63,6 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             min_file_size: 1024 * 1024, // 1 MiB
-            cache_files: true,
             full: false,
         }
     }
@@ -93,17 +90,12 @@ pub fn scan_directory(
     progress: &ScanProgress,
 ) -> Result<()> {
     // Collect all entries from the parallel walk first.
-    let mut entries: Vec<_> = WalkDir::new(root)
+    let entries: Vec<_> = WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .collect();
-
-    // Sort by depth (path component count) so parents are always
-    // processed before children. jwalk's parallel walk does NOT
-    // guarantee parent-before-child order.
-    entries.sort_by_key(|e| e.path().components().count());
 
     // ------------------------------------------------------------------
     // First pass: assign directory IDs in depth order so parents always
@@ -177,9 +169,6 @@ pub fn scan_directory(
         }
 
         // Size filter (skip if not full mode and below threshold)
-        if !config.full && !config.cache_files {
-            continue;
-        }
         if !config.full && meta.logical_size < config.min_file_size {
             continue;
         }
@@ -255,7 +244,6 @@ mod tests {
         let config = ScanConfig {
             full: true,
             min_file_size: 0,
-            cache_files: true,
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
@@ -291,7 +279,6 @@ mod tests {
         let config = ScanConfig {
             full: true,
             min_file_size: 0,
-            cache_files: true,
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
@@ -301,6 +288,74 @@ mod tests {
 
         // Only real.txt should be indexed (link is skipped)
         assert_eq!(progress.files(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_empty_directory() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        let mut conn = make_conn();
+        let progress = ScanProgress::new();
+        let config = ScanConfig {
+            full: true,
+            min_file_size: 0,
+        };
+        {
+            let mut writer = CacheWriter::new(&mut conn, 1000);
+            scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize()?;
+        }
+
+        assert_eq!(progress.dirs(), 1, "should find 1 dir (root only)");
+        assert_eq!(progress.files(), 0, "should find 0 files");
+
+        let dir_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM dirs", [], |r| r.get(0))?;
+        let file_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        assert_eq!(dir_count, 1);
+        assert_eq!(file_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_permission_denied_handling() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        // Create an accessible file
+        std::fs::write(root.join("accessible.txt"), b"hello")?;
+
+        // Create a subdirectory with no permissions
+        let forbidden = root.join("forbidden");
+        std::fs::create_dir(&forbidden)?;
+        std::fs::write(forbidden.join("secret.txt"), b"hidden")?;
+        std::fs::set_permissions(&forbidden, std::fs::Permissions::from_mode(0o000))?;
+
+        let mut conn = make_conn();
+        let progress = ScanProgress::new();
+        let config = ScanConfig {
+            full: true,
+            min_file_size: 0,
+        };
+        let result = {
+            let mut writer = CacheWriter::new(&mut conn, 1000);
+            let r = scan_directory(root, &config, &mut writer, &progress);
+            writer.finalize()?;
+            r
+        };
+
+        // The scan should complete without error (skips the unreadable dir)
+        assert!(result.is_ok(), "scan should complete without error even with permission-denied dirs");
+
+        // Restore permissions so the tempdir can be cleaned up
+        std::fs::set_permissions(&forbidden, std::fs::Permissions::from_mode(0o755))?;
+
         Ok(())
     }
 
@@ -320,7 +375,6 @@ mod tests {
         let config = ScanConfig {
             full: false,
             min_file_size: 1024 * 1024,
-            cache_files: true,
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);

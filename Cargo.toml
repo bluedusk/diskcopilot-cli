@@ -30,9 +30,6 @@ ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tui-tree-widget = "0.22"
 
-# Search
-nucleo = "0.5"
-
 # Serialization & config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

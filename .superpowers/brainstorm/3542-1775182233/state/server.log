@@ -1,0 +1,2 @@
+{"type":"server-started","port":60963,"host":"127.0.0.1","url_host":"localhost","url":"http://localhost:60963","screen_dir":"/Users/danzhu/playground/diskcopilot-cli/.superpowers/brainstorm/3542-1775182233/content","state_dir":"/Users/danzhu/playground/diskcopilot-cli/.superpowers/brainstorm/3542-1775182233/state"}
+{"type":"server-stopped","reason":"idle timeout"}

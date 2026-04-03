@@ -135,4 +135,21 @@ mod tests {
         // /var/folders is commonly used for temp files and should be safe
         assert!(!is_dangerous_path(Path::new("/var/folders/abc")));
     }
+
+    #[test]
+    fn test_paths_inside_dangerous_roots_blocked() {
+        // /System is a DANGEROUS_ROOT — anything under it should be blocked
+        assert!(is_dangerous_path(Path::new("/System/Library/CoreServices")));
+        // /Library is a DANGEROUS_ROOT — sub-paths should be blocked
+        assert!(is_dangerous_path(Path::new(
+            "/Library/Frameworks/Something.framework"
+        )));
+    }
+
+    #[test]
+    fn test_users_subpaths_are_safe() {
+        // /Users is in BLOCKED_EXACT (not prefix-matched via DANGEROUS_ROOTS),
+        // so deep paths under /Users should be safe.
+        assert!(!is_dangerous_path(Path::new("/Users/alice/Library/Caches")));
+    }
 }

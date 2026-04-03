@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::io::Read as IoRead;
+use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -811,6 +811,45 @@ mod tests {
         assert!(g.file_ids.contains(&1));
         assert!(g.file_ids.contains(&2));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_reconstruct_path_root_node() -> Result<()> {
+        let conn = setup_db();
+        // Root node (id=1) has no parent — should return just "home"
+        let path = reconstruct_path(&conn, 1)?;
+        assert_eq!(path, "home");
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_children_leaf_directory() -> Result<()> {
+        // Create a dedicated DB with a leaf dir that has no children at all.
+        let conn2 = open_memory_db()?;
+        create_tables(&conn2)?;
+        let mut conn2 = conn2;
+        {
+            let mut w = CacheWriter::new(&mut conn2, 100);
+            w.add_dir(DirEntry {
+                id: 1,
+                parent_id: None,
+                name: "root".into(),
+                created_at: None,
+                modified_at: None,
+            })?;
+            w.add_dir(DirEntry {
+                id: 2,
+                parent_id: Some(1),
+                name: "empty_leaf".into(),
+                created_at: None,
+                modified_at: None,
+            })?;
+            w.finalize()?;
+        }
+
+        let children = load_children(&conn2, 2)?;
+        assert!(children.is_empty(), "leaf directory with no children should return empty Vec");
         Ok(())
     }
 }

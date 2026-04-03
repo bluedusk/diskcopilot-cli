@@ -108,7 +108,6 @@ async fn run_scan(
     let progress = Arc::new(ScanProgress::new());
     let config = ScanConfig {
         min_file_size,
-        cache_files: !full, // when full=true we use the full flag; otherwise respect min_size
         full,
     };
 
@@ -138,6 +137,9 @@ async fn run_scan(
     });
 
     // 6. Walk the filesystem
+    // Disable FK checks during scan to allow inserting entries in any order
+    // (jwalk's parallel walk does not guarantee parent-before-child ordering).
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
     {
         let mut cache_writer = writer::CacheWriter::new(&mut conn, 10_000);
         scan_directory(&path, &config, &mut cache_writer, &progress)?;
@@ -161,6 +163,7 @@ async fn run_scan(
         cache_writer.write_meta(&meta)?;
         // cache_writer (and its &mut conn borrow) drops here
     }
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
     // Stop spinner
     spinner_handle.abort();

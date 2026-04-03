@@ -38,7 +38,6 @@ fn test_scan_full_counts() -> anyhow::Result<()> {
     let config = ScanConfig {
         full: true,
         min_file_size: 0,
-        cache_files: true,
     };
 
     {
@@ -88,7 +87,6 @@ fn test_hardlink_dedup() -> anyhow::Result<()> {
     let config = ScanConfig {
         full: true,
         min_file_size: 0,
-        cache_files: true,
     };
 
     {

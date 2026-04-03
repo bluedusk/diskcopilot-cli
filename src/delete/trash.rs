@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use crate::scanner::safety::is_dangerous_path;
@@ -20,15 +21,16 @@ pub struct DeleteResult {
 // ---------------------------------------------------------------------------
 
 /// Calculate the total disk size of a path (file or directory tree).
+/// Uses `blocks * 512` to reflect actual disk usage rather than logical size.
 fn calc_size(path: &Path) -> u64 {
     if path.is_file() {
-        path.metadata().map(|m| m.len()).unwrap_or(0)
+        path.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
     } else if path.is_dir() {
         jwalk::WalkDir::new(path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .filter_map(|e| e.metadata().ok().map(|m| m.blocks() * 512))
             .sum()
     } else {
         0
@@ -173,5 +175,27 @@ mod tests {
         // but /usr has 2 and is on the blocklist — use /tmp which is also blocked
         let err = delete_permanent("/tmp").unwrap_err();
         assert!(err.to_string().contains("dangerous"));
+    }
+
+    #[test]
+    fn test_permanent_delete_directory_tree() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dir = tmp.path().join("target_dir");
+        std::fs::create_dir(&dir).expect("create target dir");
+        std::fs::write(dir.join("file1.txt"), b"hello world").expect("write file1");
+        let sub = dir.join("subdir");
+        std::fs::create_dir(&sub).expect("create subdir");
+        std::fs::write(sub.join("file2.txt"), b"nested content here").expect("write file2");
+
+        let path_str = dir.to_str().expect("valid UTF-8").to_string();
+
+        let result = delete_permanent(&path_str).expect("delete_permanent should return Ok");
+
+        assert!(result.success, "expected success, got error: {:?}", result.error);
+        assert!(result.size_freed > 0, "should have freed some bytes from directory tree");
+        assert!(
+            !Path::new(&path_str).exists(),
+            "directory should no longer exist after permanent delete"
+        );
     }
 }

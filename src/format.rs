@@ -73,4 +73,25 @@ mod tests {
         assert_eq!(parse_size("500KB").unwrap(), 512000);
         assert_eq!(parse_size("2TB").unwrap(), 2 * 1024 * 1024 * 1024 * 1024);
     }
+
+    #[test]
+    fn test_parse_size_zero() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_size_whitespace_trimming() {
+        assert_eq!(parse_size("  100M  ").unwrap(), 104857600);
+    }
+
+    #[test]
+    fn test_parse_size_empty_string_errors() {
+        assert!(parse_size("").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_fractional_values() {
+        // 1.5G = 1.5 * 1024^3 = 1610612736
+        assert_eq!(parse_size("1.5G").unwrap(), 1610612736);
+    }
 }

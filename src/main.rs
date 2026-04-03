@@ -1,3 +1,4 @@
+mod cache;
 mod format;
 
 use clap::{Parser, Subcommand};

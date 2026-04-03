@@ -271,13 +271,26 @@ impl App {
     }
 
     /// Move cursor by `delta` rows (positive = down, negative = up).
+    /// Adjusts scroll_offset to keep the cursor visible in the viewport.
     pub fn move_cursor(&mut self, delta: i64) {
-        let len = self.visible_items.len().max(self.list_items.len());
+        let len = if self.view == View::Tree {
+            self.visible_items.len()
+        } else {
+            self.list_items.len()
+        };
         if len == 0 {
             return;
         }
         let new_cursor = (self.cursor as i64 + delta).clamp(0, len as i64 - 1) as usize;
         self.cursor = new_cursor;
+
+        // Keep cursor visible: scroll up or down as needed
+        let visible_height: usize = 40;
+        if self.cursor < self.scroll_offset {
+            self.scroll_offset = self.cursor;
+        } else if self.cursor >= self.scroll_offset + visible_height {
+            self.scroll_offset = self.cursor + 1 - visible_height;
+        }
     }
 
     /// Toggle expansion of the item at the current cursor position.

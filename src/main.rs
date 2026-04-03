@@ -3,7 +3,9 @@ use diskcopilot::format::{format_size, parse_size};
 use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
 
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -65,7 +67,7 @@ enum Commands {
 }
 
 /// Execute a scan and store results in the cache database.
-fn run_scan(
+async fn run_scan(
     path: PathBuf,
     full: bool,
     _dirs_only: bool,
@@ -92,7 +94,7 @@ fn run_scan(
     schema::create_tables(&conn)?;
 
     // 5. Create progress tracker and writer
-    let progress = ScanProgress::new();
+    let progress = Arc::new(ScanProgress::new());
     let config = ScanConfig {
         min_file_size,
         cache_files: !full, // when full=true we use the full flag; otherwise respect min_size
@@ -101,7 +103,28 @@ fn run_scan(
 
     let start = Instant::now();
 
-    println!("Scanning: {}", path.display());
+    // Set up spinner
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .expect("valid spinner template"),
+    );
+    pb.set_message(format!("Scanning {}...", path.display()));
+
+    // Spawn a task that updates the spinner message every 100ms
+    let pb_clone = pb.clone();
+    let progress_clone = Arc::clone(&progress);
+    let spinner_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            ticker.tick().await;
+            let files = progress_clone.files();
+            let dirs = progress_clone.dirs();
+            let size = format_size(progress_clone.size());
+            pb_clone.set_message(format!("Scanning... {} files, {} dirs, {}", files, dirs, size));
+        }
+    });
 
     // 6. Walk the filesystem
     {
@@ -128,6 +151,10 @@ fn run_scan(
         // cache_writer (and its &mut conn borrow) drops here
     }
 
+    // Stop spinner
+    spinner_handle.abort();
+    pb.finish_and_clear();
+
     // 8. Create indexes after bulk insert for maximum ingestion throughput
     schema::create_indexes(&conn)?;
 
@@ -135,11 +162,11 @@ fn run_scan(
 
     // 10. Print summary
     println!(
-        "Done in {:.2}s — {} files, {} dirs, {} scanned",
-        elapsed.as_secs_f64(),
+        "✓ {} files, {} dirs, {} scanned in {:.2}s",
         progress.files(),
         progress.dirs(),
         format_size(progress.size()),
+        elapsed.as_secs_f64(),
     );
     println!("Cache: {}", db_path.display());
 
@@ -157,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
             dirs_only,
             min_size,
             ..
-        } => run_scan(path, full, dirs_only, &min_size),
+        } => run_scan(path, full, dirs_only, &min_size).await,
         Commands::Tui { path, theme, .. } => {
             // Determine path and look for cache
             let target = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());

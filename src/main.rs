@@ -1,10 +1,17 @@
 use diskcopilot::cache::{self, schema, writer};
+use diskcopilot::cache::reader::{
+    find_duplicates, load_root, load_scan_meta, load_tree_to_depth,
+    query_dev_artifacts, query_large_files, query_old_files, query_recent_files,
+};
+use diskcopilot::delete::trash::{delete_permanent, move_to_trash};
 use diskcopilot::format::{format_size, parse_size};
+use diskcopilot::scanner::safety::is_dangerous_path;
 use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
+use diskcopilot::output;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -64,6 +71,94 @@ enum Commands {
         #[arg(long, default_value = "dark")]
         theme: String,
     },
+
+    /// Query cached scan data
+    Query {
+        #[command(subcommand)]
+        command: QueryCommand,
+    },
+
+    /// Delete a file or directory
+    Delete {
+        /// Path to delete
+        path: String,
+        /// Move to system Trash
+        #[arg(long)]
+        trash: bool,
+        /// Permanently delete
+        #[arg(long)]
+        permanent: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueryCommand {
+    /// Find largest files
+    LargeFiles {
+        /// Path that was scanned
+        path: PathBuf,
+        /// Minimum file size (e.g., 100M, 1G)
+        #[arg(long, default_value = "100M")]
+        min_size: String,
+        /// Maximum results
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find recently modified files
+    Recent {
+        path: PathBuf,
+        /// Files modified within this many days
+        #[arg(long, default_value = "7")]
+        days: u64,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find old files
+    Old {
+        path: PathBuf,
+        /// Files not modified for this many days
+        #[arg(long, default_value = "365")]
+        days: u64,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find dev artifact directories (node_modules, target, etc.)
+    DevArtifacts {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find duplicate files by content
+    Duplicates {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show directory size tree
+    Tree {
+        path: PathBuf,
+        /// Max depth to show
+        #[arg(long, default_value = "2")]
+        depth: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show scan metadata
+    Info {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Execute a scan and store results in the cache database.
@@ -75,6 +170,12 @@ async fn run_scan(
     cross_firmlinks: bool,
     min_size: &str,
 ) -> anyhow::Result<()> {
+    if is_dangerous_path(&path) {
+        anyhow::bail!(
+            "Refusing to scan '{}': system-protected path. Use a more specific subdirectory.",
+            path.display()
+        );
+    }
     if dirs_only {
         eprintln!("Warning: --dirs-only is not yet implemented");
     }
@@ -100,8 +201,8 @@ async fn run_scan(
         std::fs::remove_file(&db_path)?;
     }
 
-    // 4. Open DB + create tables
-    let mut conn = schema::open_db(&db_path)?;
+    // 4. Open DB + create tables (bulk-write mode for scan)
+    let mut conn = schema::open_db_for_scan(&db_path)?;
     schema::create_tables(&conn)?;
 
     // 5. Create progress tracker and writer
@@ -187,6 +288,165 @@ async fn run_scan(
     Ok(())
 }
 
+fn run_query(command: QueryCommand) -> anyhow::Result<()> {
+    // Helper to open DB for a given path
+    let open_cache = |path: &Path| -> anyhow::Result<rusqlite::Connection> {
+        let db_path = cache::db_path_for(path)?;
+        if !db_path.exists() {
+            anyhow::bail!(
+                "No cache found for '{}'. Run 'diskcopilot scan {}' first.",
+                path.display(),
+                path.display()
+            );
+        }
+        schema::open_db(&db_path)
+    };
+
+    match command {
+        QueryCommand::LargeFiles {
+            path,
+            min_size,
+            limit,
+            json,
+        } => {
+            let conn = open_cache(&path)?;
+            let min = parse_size(&min_size)?;
+            let rows = query_large_files(&conn, min, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                output::print_file_rows(&rows);
+            }
+        }
+        QueryCommand::Recent {
+            path,
+            days,
+            limit,
+            json,
+        } => {
+            let conn = open_cache(&path)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let cutoff = now - (days as i64 * 86400);
+            let rows = query_recent_files(&conn, cutoff, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                output::print_file_rows(&rows);
+            }
+        }
+        QueryCommand::Old {
+            path,
+            days,
+            limit,
+            json,
+        } => {
+            let conn = open_cache(&path)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let cutoff = now - (days as i64 * 86400);
+            let rows = query_old_files(&conn, cutoff, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                output::print_file_rows(&rows);
+            }
+        }
+        QueryCommand::DevArtifacts { path, json } => {
+            let conn = open_cache(&path)?;
+            let nodes = query_dev_artifacts(&conn)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&nodes)?);
+            } else {
+                output::print_tree_nodes(&nodes);
+            }
+        }
+        QueryCommand::Duplicates { path, json } => {
+            let conn = open_cache(&path)?;
+            let groups = find_duplicates(&conn, |done, total| {
+                if !json {
+                    eprint!("\r  Hashing... {}/{}", done, total);
+                }
+            })?;
+            if !json {
+                eprintln!(); // clear progress line
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&groups)?);
+            } else {
+                output::print_duplicate_groups(&groups);
+            }
+        }
+        QueryCommand::Tree { path, depth, json } => {
+            let conn = open_cache(&path)?;
+            let root = load_root(&conn)?;
+            let tree = load_tree_to_depth(&conn, root.id, depth)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tree)?);
+            } else {
+                output::print_tree(&tree, 0);
+            }
+        }
+        QueryCommand::Info { path, json } => {
+            let conn = open_cache(&path)?;
+            let meta = load_scan_meta(&conn)?;
+            match meta {
+                Some(m) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&m)?);
+                    } else {
+                        output::print_scan_meta(&m);
+                    }
+                }
+                None => {
+                    if json {
+                        println!("null");
+                    } else {
+                        println!("  No scan metadata found.");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_delete(path: String, trash: bool, permanent: bool, json: bool) -> anyhow::Result<()> {
+    if !trash && !permanent {
+        anyhow::bail!("Specify --trash or --permanent");
+    }
+    if trash && permanent {
+        anyhow::bail!("Specify either --trash or --permanent, not both");
+    }
+
+    let result = if trash {
+        move_to_trash(&path)?
+    } else {
+        delete_permanent(&path)?
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.success {
+        println!(
+            "  Deleted: {} (freed {})",
+            result.path,
+            format_size(result.size_freed)
+        );
+    } else {
+        eprintln!(
+            "  Error: {}",
+            result.error.as_deref().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -200,7 +460,14 @@ async fn main() -> anyhow::Result<()> {
             accurate,
             cross_firmlinks,
         } => run_scan(path, full, dirs_only, accurate, cross_firmlinks, &min_size).await,
-        Commands::Tui { path, theme, cached, depth, top, .. } => {
+        Commands::Tui {
+            path,
+            theme,
+            cached,
+            depth,
+            top,
+            ..
+        } => {
             if cached {
                 eprintln!("Warning: --cached is not yet implemented");
             }
@@ -226,5 +493,12 @@ async fn main() -> anyhow::Result<()> {
             let conn = diskcopilot::cache::schema::open_db(&db_path)?;
             diskcopilot::tui::app::run(conn, &theme).await
         }
+        Commands::Query { command } => run_query(command),
+        Commands::Delete {
+            path,
+            trash,
+            permanent,
+            json,
+        } => run_delete(path, trash, permanent, json),
     }
 }

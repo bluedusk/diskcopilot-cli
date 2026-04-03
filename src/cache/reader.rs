@@ -419,6 +419,107 @@ pub fn query_recent_files(
     resolve_paths(conn, raw)
 }
 
+/// Return files with the given extension, sorted by disk_size DESC,
+/// limited to `limit` rows. full_path is reconstructed.
+pub fn query_by_extension(
+    conn: &Connection,
+    ext: &str,
+    limit: usize,
+) -> Result<Vec<FileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.dir_id, f.name, f.disk_size, f.logical_size,
+                f.created_at, f.modified_at, f.extension
+         FROM files f
+         WHERE f.extension = ?1
+         ORDER BY f.disk_size DESC
+         LIMIT ?2",
+    )?;
+    let lim = limit as i64;
+    let raw = query_raw_rows(&mut stmt, &[&ext, &lim])?;
+    resolve_paths(conn, raw)
+}
+
+/// Return files whose name contains `pattern` (case-insensitive), sorted by
+/// disk_size DESC, limited to `limit` rows. full_path is reconstructed.
+pub fn query_by_name(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<FileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.dir_id, f.name, f.disk_size, f.logical_size,
+                f.created_at, f.modified_at, f.extension
+         FROM files f
+         WHERE LOWER(f.name) LIKE '%' || LOWER(?1) || '%'
+         ORDER BY f.disk_size DESC
+         LIMIT ?2",
+    )?;
+    let lim = limit as i64;
+    let raw = query_raw_rows(&mut stmt, &[&pattern, &lim])?;
+    resolve_paths(conn, raw)
+}
+
+/// Summary data combining multiple analyses for a one-shot cleanup report.
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupSummary {
+    pub total_size: u64,
+    pub total_files: u64,
+    pub large_files: Vec<FileRow>,
+    pub dev_artifacts: Vec<TreeNode>,
+    pub old_files_size: u64,
+    pub old_files_count: u64,
+    pub potential_savings: u64,
+}
+
+/// Build a cleanup summary by combining large files, dev artifacts, and old
+/// file statistics.
+pub fn query_summary(conn: &Connection) -> Result<CleanupSummary> {
+    // Total size and file count from root dir aggregate
+    let (total_size, total_files): (u64, u64) = conn
+        .query_row(
+            "SELECT COALESCE(total_disk_size, 0), COALESCE(total_file_count, 0)
+             FROM dirs WHERE parent_id IS NULL",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
+        .unwrap_or((0, 0));
+
+    // Top 10 largest files (>= 100 MB)
+    let large_files = query_large_files(conn, 100 * 1024 * 1024, 10)?;
+
+    // Dev artifact directories
+    let dev_artifacts = query_dev_artifacts(conn)?;
+
+    // Old files: files not modified in the past 365 days
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - (365 * 86400);
+
+    let (old_files_size, old_files_count): (u64, u64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(disk_size), 0), COUNT(*)
+             FROM files WHERE modified_at < ?1",
+            rusqlite::params![cutoff],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
+        .unwrap_or((0, 0));
+
+    let dev_artifacts_size: u64 = dev_artifacts.iter().map(|n| n.disk_size).sum();
+    let potential_savings = dev_artifacts_size + old_files_size;
+
+    Ok(CleanupSummary {
+        total_size,
+        total_files,
+        large_files,
+        dev_artifacts,
+        old_files_size,
+        old_files_count,
+        potential_savings,
+    })
+}
+
 /// Return files modified before `before_timestamp`, sorted by disk_size DESC,
 /// limited to `limit` rows.
 pub fn query_old_files(

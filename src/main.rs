@@ -1,12 +1,14 @@
 use diskcopilot::cache::{self, schema, writer};
 use diskcopilot::cache::reader::{
     find_duplicates, load_root, load_scan_meta, load_tree_to_depth,
-    query_dev_artifacts, query_large_files, query_old_files, query_recent_files,
+    query_by_extension, query_by_name, query_dev_artifacts, query_large_files,
+    query_old_files, query_recent_files, query_summary,
 };
 use diskcopilot::delete::trash::{delete_permanent, move_to_trash};
 use diskcopilot::format::{format_size, parse_size};
-use diskcopilot::scanner::safety::is_dangerous_path;
 use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
+#[cfg(target_os = "macos")]
+use diskcopilot::scanner::bulk_walker::{scan_directory_bulk, supports_bulk_attrs};
 use diskcopilot::output;
 
 use clap::{Parser, Subcommand};
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "diskcopilot", about = "Fast Mac disk scanner and query tool")]
+#[command(name = "diskcopilot-cli", about = "Fast Mac disk scanner and query tool")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -48,6 +50,10 @@ enum Commands {
         /// Follow firmlinks (macOS system volumes)
         #[arg(long)]
         cross_firmlinks: bool,
+
+        /// Skip safety warnings for system paths
+        #[arg(long)]
+        force: bool,
     },
 
     /// Query cached scan data
@@ -137,6 +143,34 @@ enum QueryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Find files by extension
+    Ext {
+        path: PathBuf,
+        /// File extension (e.g., dmg, pdf, mp4)
+        #[arg(long)]
+        ext: String,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search files by name
+    Search {
+        path: PathBuf,
+        /// Search pattern (case-insensitive substring)
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cleanup summary report
+    Summary {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Execute a scan and store results in the cache database.
@@ -146,11 +180,18 @@ async fn run_scan(
     dirs_only: bool,
     accurate: bool,
     cross_firmlinks: bool,
+    force: bool,
     min_size: &str,
 ) -> anyhow::Result<()> {
-    if is_dangerous_path(&path) {
+    // Warn on system paths, but let --force override
+    let path_str = path.to_string_lossy();
+    let is_system = path_str == "/"
+        || path_str.starts_with("/System")
+        || path_str.starts_with("/Library")
+        || path_str.starts_with("/private");
+    if is_system && !force {
         anyhow::bail!(
-            "Refusing to scan '{}': system-protected path. Use a more specific subdirectory.",
+            "'{}' is a system path. This may take a very long time. Use --force to proceed.",
             path.display()
         );
     }
@@ -192,76 +233,138 @@ async fn run_scan(
 
     let start = Instant::now();
 
-    // Set up spinner
+    // Set up colorful progress bar
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
+            .template("{spinner:.cyan} {msg}")
             .expect("valid spinner template"),
     );
-    pb.set_message(format!("Scanning {}...", path.display()));
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    // Spawn a task that updates the spinner message every 100ms
+    // Spawn a task that updates the spinner with elapsed time
     let pb_clone = pb.clone();
-    let progress_clone = Arc::clone(&progress);
+    let path_display = path.display().to_string();
     let spinner_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             ticker.tick().await;
-            let files = progress_clone.files();
-            let dirs = progress_clone.dirs();
-            let size = format_size(progress_clone.size());
-            pb_clone.set_message(format!("Scanning... {} files, {} dirs, {}", files, dirs, size));
+            let elapsed = start.elapsed().as_secs();
+            pb_clone.set_message(format!(
+                "\x1b[1mScanning\x1b[0m \x1b[36m{}\x1b[0m \x1b[90m({}s)\x1b[0m",
+                path_display, elapsed
+            ));
         }
     });
 
     // 6. Walk the filesystem
     // Disable FK checks during scan to allow inserting entries in any order
     // (jwalk's parallel walk does not guarantee parent-before-child ordering).
-    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA journal_mode=OFF; PRAGMA locking_mode=EXCLUSIVE;")?;
     {
-        let mut cache_writer = writer::CacheWriter::new(&mut conn, 10_000);
-        scan_directory(&path, &config, &mut cache_writer, &progress)?;
+        let mut cache_writer = writer::CacheWriter::new(&mut conn, 500_000);
+        cache_writer.begin()?;
+
+        // On macOS, prefer the getattrlistbulk-based scanner (3-6x faster on APFS).
+        // Fall back to the jwalk-based scanner for non-APFS volumes (exFAT, FAT32, NTFS).
+        #[cfg(target_os = "macos")]
+        let used_bulk = if supports_bulk_attrs(&path) {
+            scan_directory_bulk(&path, &config, &mut cache_writer, &progress)?;
+            true
+        } else {
+            scan_directory(&path, &config, &mut cache_writer, &progress)?;
+            false
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let used_bulk = {
+            scan_directory(&path, &config, &mut cache_writer, &progress)?;
+            false
+        };
+
+        let _ = used_bulk; // suppress unused-variable warning in some cfg combinations
+
+        cache_writer.commit()?;
 
         // 7. Finalize (flush buffers + compute dir size rollups)
         cache_writer.finalize()?;
-
-        // 9. Write scan metadata (before dropping the writer)
-        let elapsed_ms = start.elapsed().as_millis() as i64;
-        let meta = writer::ScanMeta {
-            root_path: path.to_string_lossy().into_owned(),
-            scanned_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            total_files: progress.files() as i64,
-            total_dirs: progress.dirs() as i64,
-            total_size: progress.size() as i64,
-            scan_duration_ms: elapsed_ms,
-        };
-        cache_writer.write_meta(&meta)?;
         // cache_writer (and its &mut conn borrow) drops here
     }
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
     // Stop spinner
     spinner_handle.abort();
-    pb.finish_and_clear();
+    pb.set_message("Building indexes...");
 
     // 8. Create indexes after bulk insert for maximum ingestion throughput
     schema::create_indexes(&conn)?;
 
+    pb.finish_and_clear();
     let elapsed = start.elapsed();
 
-    // 10. Print summary
-    println!(
-        "✓ {} files, {} dirs, {} scanned in {:.2}s",
-        progress.files(),
-        progress.dirs(),
-        format_size(progress.size()),
-        elapsed.as_secs_f64(),
-    );
-    println!("Cache: {}", db_path.display());
+    // Get accurate totals from DB (includes bundles and rollup)
+    let (total_files, total_dirs, total_size) = conn.query_row(
+        "SELECT COALESCE(total_file_count,0),
+                (SELECT COUNT(*) FROM dirs),
+                COALESCE(total_disk_size,0)
+         FROM dirs WHERE parent_id IS NULL",
+        [],
+        |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)),
+    ).unwrap_or((progress.files() as i64, progress.dirs() as i64, progress.size() as i64));
+
+    // Write scan metadata with accurate DB totals
+    conn.execute(
+        "INSERT INTO scan_meta (root_path, scanned_at, total_files, total_dirs, total_size, scan_duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            path.to_string_lossy().as_ref(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            total_files,
+            total_dirs,
+            total_size,
+            elapsed.as_millis() as i64,
+        ],
+    )?;
+
+    let files = total_files as u64;
+    let dirs = total_dirs as u64;
+    let size = format_size(total_size as u64);
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.0 { files as f64 / secs } else { 0.0 };
+    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+    println!("\n\x1b[1;32m✓ Scan complete\x1b[0m");
+    println!("  \x1b[1mFiles:\x1b[0m   \x1b[33m{}\x1b[0m", files);
+    println!("  \x1b[1mDirs:\x1b[0m    \x1b[33m{}\x1b[0m", dirs);
+    println!("  \x1b[1mSize:\x1b[0m    \x1b[32m{}\x1b[0m", size);
+    println!("  \x1b[1mTime:\x1b[0m    \x1b[36m{:.2}s\x1b[0m ({:.0} files/s)", secs, rate);
+    println!("  \x1b[1mCache:\x1b[0m   {} \x1b[90m({})\x1b[0m", format_size(db_size), db_path.display());
+
+    // Show disk context for root/drive scans
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        if let Ok(c_path) = CString::new(path.as_os_str().as_encoded_bytes()) {
+            let mut stat: MaybeUninit<libc::statfs> = MaybeUninit::uninit();
+            if unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+                let stat = unsafe { stat.assume_init() };
+                let block_size = stat.f_bsize as u64;
+                let total_space = stat.f_blocks * block_size;
+                let free_space = stat.f_bavail * block_size;
+                let used_space = total_space - free_space;
+                let scanned = total_size as u64;
+                if used_space > scanned {
+                    let hidden = used_space - scanned;
+                    println!("  \x1b[1mDisk:\x1b[0m    {} total, {} free", format_size(total_space), format_size(free_space));
+                    println!("  \x1b[1mHidden:\x1b[0m  \x1b[35m{}\x1b[0m \x1b[90m(snapshots, protected system files, APFS metadata)\x1b[0m", format_size(hidden));
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -369,6 +472,43 @@ fn run_query(command: QueryCommand) -> anyhow::Result<()> {
                 output::print_tree(&tree, 0);
             }
         }
+        QueryCommand::Ext {
+            path,
+            ext,
+            limit,
+            json,
+        } => {
+            let conn = open_cache(&path)?;
+            let rows = query_by_extension(&conn, &ext, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                output::print_file_rows(&rows);
+            }
+        }
+        QueryCommand::Search {
+            path,
+            name,
+            limit,
+            json,
+        } => {
+            let conn = open_cache(&path)?;
+            let rows = query_by_name(&conn, &name, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                output::print_file_rows(&rows);
+            }
+        }
+        QueryCommand::Summary { path, json } => {
+            let conn = open_cache(&path)?;
+            let summary = query_summary(&conn)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                output::print_summary(&summary);
+            }
+        }
         QueryCommand::Info { path, json } => {
             let conn = open_cache(&path)?;
             let meta = load_scan_meta(&conn)?;
@@ -437,7 +577,8 @@ async fn main() -> anyhow::Result<()> {
             min_size,
             accurate,
             cross_firmlinks,
-        } => run_scan(path, full, dirs_only, accurate, cross_firmlinks, &min_size).await,
+            force,
+        } => run_scan(path, full, dirs_only, accurate, cross_firmlinks, force, &min_size).await,
         Commands::Query { command } => run_query(command),
         Commands::Delete {
             path,

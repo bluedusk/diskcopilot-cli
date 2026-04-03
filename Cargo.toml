@@ -27,7 +27,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # TUI
 ratatui = "0.28"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 tui-tree-widget = "0.22"
 
 # Search
@@ -43,6 +43,7 @@ dirs = "5"
 indicatif = "0.17"
 blake3 = "1"
 trash = "5"
+futures = "0.3"
 anyhow = "1"
 
 [dev-dependencies]

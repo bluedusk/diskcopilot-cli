@@ -158,9 +158,22 @@ async fn main() -> anyhow::Result<()> {
             min_size,
             ..
         } => run_scan(path, full, dirs_only, &min_size),
-        Commands::Tui { path, .. } => {
-            println!("TUI: {:?}", path.map(|p| p.display().to_string()));
-            Ok(())
+        Commands::Tui { path, theme, .. } => {
+            // Determine path and look for cache
+            let target = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let db_path = diskcopilot::cache::db_path_for(&target)?;
+
+            if !db_path.exists() {
+                eprintln!(
+                    "No cache found for {}. Run `diskcopilot scan {}` first.",
+                    target.display(),
+                    target.display()
+                );
+                std::process::exit(1);
+            }
+
+            let conn = diskcopilot::cache::schema::open_db(&db_path)?;
+            diskcopilot::tui::app::run(conn, &theme).await
         }
     }
 }

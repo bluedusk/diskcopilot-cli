@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast, accurate Mac disk scanner with interactive TUI"
 
+[[bin]]
+name = "diskcopilot"
+path = "src/main.rs"
+
+[lib]
+name = "diskcopilot"
+path = "src/lib.rs"
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }

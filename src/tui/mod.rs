@@ -1,126 +1,225 @@
 pub mod app;
+pub mod detail;
 pub mod event;
 pub mod icons;
+pub mod statusbar;
+pub mod tabs;
 pub mod theme;
+pub mod tree;
+pub mod views;
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use app::{App, View};
+use detail::DetailPane;
+use statusbar::StatusBar;
+use tabs::TabBar;
+use tree::TreeView;
+
+use crate::format::format_size;
+
+// ---------------------------------------------------------------------------
+// Top-level render function
+// ---------------------------------------------------------------------------
 
 /// Top-level render function. Called every frame.
-///
-/// Currently a placeholder that shows the root path, active view, and item
-/// count. Task 9 will implement the full tree view rendering.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Divide screen into: header (1) | tabs (1) | body (fill) | status (1)
+    // Vertical layout: tab bar (1) | main content (fill) | status bar (1)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
             Constraint::Length(1), // tab bar
-            Constraint::Min(1),    // body
+            Constraint::Min(1),    // main content
             Constraint::Length(1), // status bar
         ])
         .split(area);
 
     // -----------------------------------------------------------------------
-    // Header
-    // -----------------------------------------------------------------------
-    let header_text = format!(" DiskCopilot  {}", app.root_path);
-    let header = Paragraph::new(header_text)
-        .style(app.theme.header)
-        .alignment(Alignment::Left);
-    frame.render_widget(header, chunks[0]);
-
-    // -----------------------------------------------------------------------
     // Tab bar
     // -----------------------------------------------------------------------
-    let tab_spans: Vec<Span> = View::all()
-        .iter()
-        .flat_map(|v| {
-            let style = if *v == app.view {
-                app.theme.tab_active
-            } else {
-                app.theme.tab_inactive
-            };
-            vec![
-                Span::styled(format!(" {} ", v.label()), style),
-                Span::raw(" "),
-            ]
-        })
-        .collect();
-    let tabs = Paragraph::new(Line::from(tab_spans));
-    frame.render_widget(tabs, chunks[1]);
+    frame.render_widget(TabBar::new(app), chunks[0]);
 
     // -----------------------------------------------------------------------
-    // Body — placeholder content
+    // Main content area — optionally split with detail pane
     // -----------------------------------------------------------------------
-    let item_count = if app.view == View::Tree {
-        app.visible_items.len()
+    let main_area = chunks[1];
+
+    if app.show_detail {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(65),
+                Constraint::Percentage(35),
+            ])
+            .split(main_area);
+
+        render_primary(frame, app, h_chunks[0]);
+        frame.render_widget(DetailPane::new(app), h_chunks[1]);
     } else {
-        app.list_items.len()
-    };
-
-    let sort_label = app.sort_mode.label();
-    let body_text = vec![
-        Line::from(vec![
-            Span::styled("View: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(app.view.label()),
-        ]),
-        Line::from(vec![
-            Span::styled("Sort: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(sort_label),
-        ]),
-        Line::from(vec![
-            Span::styled("Items: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(item_count.to_string()),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Press ? for help, q to quit",
-            Style::default().fg(Color::DarkGray),
-        )]),
-    ];
-
-    let body_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(app.theme.border)
-        .title(format!(" {} ", app.view.label()));
-
-    let body = Paragraph::new(body_text)
-        .block(body_block)
-        .style(app.theme.fg);
-
-    frame.render_widget(body, chunks[2]);
-
-    // -----------------------------------------------------------------------
-    // Help overlay
-    // -----------------------------------------------------------------------
-    if app.show_help {
-        render_help(frame, app);
+        render_primary(frame, app, main_area);
     }
 
     // -----------------------------------------------------------------------
     // Status bar
     // -----------------------------------------------------------------------
-    let status_text = if let Some(meta) = &app.scan_meta {
-        format!(
-            " {} files  {} dirs  cursor: {}  sort: {}",
-            meta.total_files, meta.total_dirs, app.cursor, sort_label
-        )
+    frame.render_widget(StatusBar::new(app), chunks[2]);
+
+    // -----------------------------------------------------------------------
+    // Overlays
+    // -----------------------------------------------------------------------
+    if app.show_help {
+        render_help(frame, app);
+    }
+
+    if let Some(idx) = app.confirm_delete {
+        render_confirm_delete(frame, app, idx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Primary panel (tree or list)
+// ---------------------------------------------------------------------------
+
+fn render_primary(frame: &mut Frame, app: &App, area: Rect) {
+    if app.view == View::Tree {
+        frame.render_widget(TreeView::new(app), area);
     } else {
-        format!(" cursor: {}  sort: {}", app.cursor, sort_label)
-    };
-    let status = Paragraph::new(status_text).style(app.theme.status_bar);
-    frame.render_widget(status, chunks[3]);
+        render_list_view(frame, app, area);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List view (non-tree views)
+// ---------------------------------------------------------------------------
+
+/// Render list views: Large Files, Recent, Old, Dev Artifacts, Duplicates.
+pub fn render_list_view(frame: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" {} ", app.view.label());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(app.theme.border);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let items = &app.list_items;
+
+    if items.is_empty() {
+        let msg = match app.view {
+            View::LargeFiles => " No large files found (threshold: 10 MB)",
+            View::Recent => " No recently modified files found",
+            View::Old => " No old files found",
+            View::DevArtifacts => " No dev artifact directories found",
+            View::Duplicates => " Duplicate detection not yet available",
+            View::Tree => " ",
+        };
+        let line = Line::from(Span::styled(msg, app.theme.file_small));
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        return;
+    }
+
+    let visible_height = inner.height as usize;
+    let scroll = app.scroll_offset;
+    let end = (scroll + visible_height).min(items.len());
+
+    for (row_idx, item_idx) in (scroll..end).enumerate() {
+        let row = &items[item_idx];
+        let is_selected = item_idx == app.cursor;
+        let is_marked = app.marked.contains(&item_idx);
+        let row_y = inner.y + row_idx as u16;
+
+        // Icon
+        let icon = icons::icon_for(&row.name, false, false);
+
+        // Mark indicator
+        let mark = if is_marked { "● " } else { "  " };
+
+        // Size string
+        let size_str = format_size(row.disk_size);
+
+        // Style
+        let style = if is_selected {
+            app.theme.selected
+        } else {
+            app.theme.file
+        };
+
+        // Right column: size (fixed width) + path (truncated)
+        let path_display = if row.full_path.is_empty() {
+            row.name.clone()
+        } else {
+            row.full_path.clone()
+        };
+
+        // Build row: mark + icon + name + padding + size
+        // Format: "  icon name                  1.2 MB  /full/path"
+        let size_col = format!("{:>9}", size_str);
+        let avail = inner.width as usize;
+
+        // Name section: mark(2) + icon(2) + name
+        let name_part = format!("{}{}{}", mark, icon, row.name);
+        // Right section: size + "  " + path
+        let right_part = format!("  {}  {}", size_col, path_display);
+
+        let left_max = avail.saturating_sub(right_part.len());
+        let name_display = if name_part.len() > left_max {
+            let mut s = name_part[..left_max.saturating_sub(1)].to_string();
+            s.push('…');
+            s
+        } else {
+            format!("{:<width$}", name_part, width = left_max)
+        };
+
+        // Path truncation for right part too
+        let right_display = if right_part.len() > avail.saturating_sub(name_display.len()) {
+            let available = avail.saturating_sub(name_display.len());
+            if available > 0 {
+                let r = &right_part[..available.min(right_part.len())];
+                r.to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            right_part
+        };
+
+        let full_row = format!("{}{}", name_display, right_display);
+
+        // Pad to full width
+        let full_row = format!("{:<width$}", full_row, width = avail);
+
+        let line = Line::from(Span::styled(full_row, style));
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                x: inner.x,
+                y: row_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,15 +227,9 @@ pub fn render(frame: &mut Frame, app: &App) {
 // ---------------------------------------------------------------------------
 
 fn render_help(frame: &mut Frame, app: &App) {
-    use ratatui::{
-        layout::Rect,
-        widgets::Clear,
-    };
-
     let area = frame.area();
-    // Center a 50x20 popup
-    let popup_width = 52u16.min(area.width.saturating_sub(4));
-    let popup_height = 22u16.min(area.height.saturating_sub(4));
+    let popup_width = 54u16.min(area.width.saturating_sub(4));
+    let popup_height = 24u16.min(area.height.saturating_sub(4));
     let popup_area = Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -148,27 +241,27 @@ fn render_help(frame: &mut Frame, app: &App) {
 
     let help_text = vec![
         Line::from(Span::styled(
-            "Keyboard Shortcuts",
+            "  Keyboard Shortcuts",
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )),
         Line::from(""),
-        Line::from("  j / ↓       Move down"),
-        Line::from("  k / ↑       Move up"),
-        Line::from("  l / → / ↵   Expand directory"),
-        Line::from("  h / ←       Collapse / go to parent"),
-        Line::from("  g            Jump to top"),
-        Line::from("  G            Jump to bottom"),
-        Line::from("  Ctrl-d       Page down"),
-        Line::from("  Ctrl-u       Page up"),
+        Line::from("  j / ↓         Move down"),
+        Line::from("  k / ↑         Move up"),
+        Line::from("  l / → / Enter  Expand directory"),
+        Line::from("  h / ←         Collapse / go to parent"),
+        Line::from("  g              Jump to top"),
+        Line::from("  G              Jump to bottom"),
+        Line::from("  Ctrl-d         Page down (20 rows)"),
+        Line::from("  Ctrl-u         Page up (20 rows)"),
         Line::from(""),
-        Line::from("  Tab          Next view"),
-        Line::from("  Shift-Tab    Previous view"),
-        Line::from("  s            Cycle sort mode"),
-        Line::from("  Space        Mark / unmark item"),
-        Line::from("  d            Delete (with confirm)"),
-        Line::from("  i            Toggle detail panel"),
-        Line::from("  ?            This help screen"),
-        Line::from("  q            Quit"),
+        Line::from("  Tab            Next view"),
+        Line::from("  Shift-Tab      Previous view"),
+        Line::from("  s              Cycle sort mode"),
+        Line::from("  Space          Mark / unmark item"),
+        Line::from("  d              Delete (with confirmation)"),
+        Line::from("  i              Toggle detail panel"),
+        Line::from("  ?              This help screen"),
+        Line::from("  q              Quit"),
         Line::from(""),
         Line::from(Span::styled(
             "  Press any key to close",
@@ -187,4 +280,70 @@ fn render_help(frame: &mut Frame, app: &App) {
         .style(app.theme.fg);
 
     frame.render_widget(help_widget, popup_area);
+}
+
+// ---------------------------------------------------------------------------
+// Confirm delete overlay
+// ---------------------------------------------------------------------------
+
+fn render_confirm_delete(frame: &mut Frame, app: &App, item_idx: usize) {
+    let area = frame.area();
+
+    // Get item name for display
+    let item_name = if app.view == View::Tree {
+        app.visible_items
+            .get(item_idx)
+            .map(|i| i.node.name.as_str())
+            .unwrap_or("(unknown)")
+    } else {
+        app.list_items
+            .get(item_idx)
+            .map(|r| r.name.as_str())
+            .unwrap_or("(unknown)")
+    };
+
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 7u16;
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    // Truncate long names
+    let max_name_len = (popup_width as usize).saturating_sub(6);
+    let display_name = if item_name.len() > max_name_len {
+        format!("{}…", &item_name[..max_name_len.saturating_sub(1)])
+    } else {
+        item_name.to_string()
+    };
+
+    let confirm_text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Move to trash: {}?", display_name),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  [y] Yes    [n / Esc] Cancel",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+    ];
+
+    let confirm_block = Block::default()
+        .title(" Confirm Delete ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(app.theme.bg);
+
+    let confirm_widget = Paragraph::new(confirm_text)
+        .block(confirm_block)
+        .style(app.theme.fg);
+
+    frame.render_widget(confirm_widget, popup_area);
 }

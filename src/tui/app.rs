@@ -407,13 +407,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent, conn: &Connection) -> Result<()>
         // Tab between views
         KeyCode::Tab => {
             app.view = app.view.next();
-            app.cursor = 0;
-            app.scroll_offset = 0;
+            crate::tui::views::load_current_view(app, conn)?;
         }
         KeyCode::BackTab => {
             app.view = app.view.prev();
-            app.cursor = 0;
-            app.scroll_offset = 0;
+            crate::tui::views::load_current_view(app, conn)?;
         }
 
         // Mark / unmark item

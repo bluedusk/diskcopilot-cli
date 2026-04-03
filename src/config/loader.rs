@@ -7,22 +7,6 @@ fn default_min_size() -> String {
     "1M".to_string()
 }
 
-fn default_theme() -> String {
-    "dark".to_string()
-}
-
-fn default_large_file_threshold() -> String {
-    "500M".to_string()
-}
-
-fn default_recent_days() -> u32 {
-    7
-}
-
-fn default_old_days() -> u32 {
-    365
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct ScanConfig {
     #[serde(default = "default_min_size")]
@@ -37,44 +21,10 @@ impl Default for ScanConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct TuiConfig {
-    #[serde(default = "default_theme")]
-    pub theme: String,
-    #[serde(default = "default_large_file_threshold")]
-    pub large_file_threshold: String,
-    #[serde(default = "default_recent_days")]
-    pub recent_days: u32,
-    #[serde(default = "default_old_days")]
-    pub old_days: u32,
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            theme: default_theme(),
-            large_file_threshold: default_large_file_threshold(),
-            recent_days: default_recent_days(),
-            old_days: default_old_days(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
     pub scan: ScanConfig,
-    #[serde(default)]
-    pub tui: TuiConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            scan: ScanConfig::default(),
-            tui: TuiConfig::default(),
-        }
-    }
 }
 
 /// Returns the path to the config file: `~/.diskcopilot/config.toml`
@@ -104,26 +54,21 @@ mod tests {
     fn test_default_config_values() {
         let config = Config::default();
         assert_eq!(config.scan.default_min_size, "1M");
-        assert_eq!(config.tui.theme, "dark");
-        assert_eq!(config.tui.large_file_threshold, "500M");
-        assert_eq!(config.tui.recent_days, 7);
-        assert_eq!(config.tui.old_days, 365);
     }
 
     #[test]
     fn test_partial_toml_override_falls_back_to_defaults() {
         let toml_str = r#"
-[tui]
-theme = "light"
+[scan]
+default_min_size = "10M"
 "#;
         let config: Config = toml::from_str(toml_str).expect("failed to parse TOML");
-        // Overridden field
-        assert_eq!(config.tui.theme, "light");
-        // Fields not in TOML should use defaults
-        assert_eq!(config.tui.large_file_threshold, "500M");
-        assert_eq!(config.tui.recent_days, 7);
-        assert_eq!(config.tui.old_days, 365);
-        // scan section not present, should use defaults
+        assert_eq!(config.scan.default_min_size, "10M");
+    }
+
+    #[test]
+    fn test_empty_toml_uses_defaults() {
+        let config: Config = toml::from_str("").expect("failed to parse TOML");
         assert_eq!(config.scan.default_min_size, "1M");
     }
 }

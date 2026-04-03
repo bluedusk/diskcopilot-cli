@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "diskcopilot", about = "Fast Mac disk scanner with interactive TUI")]
+#[command(name = "diskcopilot", about = "Fast Mac disk scanner and query tool")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -48,28 +48,6 @@ enum Commands {
         /// Follow firmlinks (macOS system volumes)
         #[arg(long)]
         cross_firmlinks: bool,
-    },
-
-    /// Launch interactive TUI
-    Tui {
-        /// Path to browse (scans if no cache exists)
-        path: Option<PathBuf>,
-
-        /// Use cached scan data only (no re-scan)
-        #[arg(long)]
-        cached: bool,
-
-        /// Limit tree display depth
-        #[arg(long)]
-        depth: Option<usize>,
-
-        /// Show only N largest entries per directory
-        #[arg(long)]
-        top: Option<usize>,
-
-        /// Theme name
-        #[arg(long, default_value = "dark")]
-        theme: String,
     },
 
     /// Query cached scan data
@@ -460,39 +438,6 @@ async fn main() -> anyhow::Result<()> {
             accurate,
             cross_firmlinks,
         } => run_scan(path, full, dirs_only, accurate, cross_firmlinks, &min_size).await,
-        Commands::Tui {
-            path,
-            theme,
-            cached,
-            depth,
-            top,
-            ..
-        } => {
-            if cached {
-                eprintln!("Warning: --cached is not yet implemented");
-            }
-            if depth.is_some() {
-                eprintln!("Warning: --depth is not yet implemented");
-            }
-            if top.is_some() {
-                eprintln!("Warning: --top is not yet implemented");
-            }
-            // Determine path and look for cache
-            let target = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let db_path = diskcopilot::cache::db_path_for(&target)?;
-
-            if !db_path.exists() {
-                eprintln!(
-                    "No cache found for {}. Run `diskcopilot scan {}` first.",
-                    target.display(),
-                    target.display()
-                );
-                std::process::exit(1);
-            }
-
-            let conn = diskcopilot::cache::schema::open_db(&db_path)?;
-            diskcopilot::tui::app::run(conn, &theme).await
-        }
         Commands::Query { command } => run_query(command),
         Commands::Delete {
             path,

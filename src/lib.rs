@@ -4,4 +4,3 @@ pub mod delete;
 pub mod format;
 pub mod output;
 pub mod scanner;
-pub mod tui;

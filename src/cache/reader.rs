@@ -1,1 +1,568 @@
-// Placeholder — cache reader will be implemented in Task 6.
+use anyhow::Result;
+use rusqlite::Connection;
+
+// ---------------------------------------------------------------------------
+// Output types
+// ---------------------------------------------------------------------------
+
+/// A node in the directory tree, representing either a directory or a file.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub id: i64,
+    pub name: String,
+    pub is_dir: bool,
+    pub disk_size: u64,
+    pub logical_size: u64,
+    pub file_count: u64,
+    pub created_at: Option<i64>,
+    pub modified_at: Option<i64>,
+    pub extension: Option<String>,
+    pub children: Vec<TreeNode>,
+}
+
+/// A flat file row with a reconstructed full path.
+#[derive(Debug, Clone)]
+pub struct FileRow {
+    pub name: String,
+    pub full_path: String,
+    pub disk_size: u64,
+    pub logical_size: u64,
+    pub created_at: Option<i64>,
+    pub modified_at: Option<i64>,
+    pub extension: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Core helpers
+// ---------------------------------------------------------------------------
+
+/// Walk the parent_id chain upward from `dir_id` and build a "/" -separated
+/// path string, e.g. `"home/projects/node_modules"`.
+pub fn reconstruct_path(conn: &Connection, dir_id: i64) -> Result<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = dir_id;
+
+    loop {
+        let row: (String, Option<i64>) = conn.query_row(
+            "SELECT name, parent_id FROM dirs WHERE id = ?1",
+            rusqlite::params![current],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        parts.push(row.0);
+        match row.1 {
+            Some(pid) => current = pid,
+            None => break,
+        }
+    }
+
+    parts.reverse();
+    Ok(parts.join("/"))
+}
+
+// ---------------------------------------------------------------------------
+// Tree loading
+// ---------------------------------------------------------------------------
+
+/// Return the root directory (the one whose parent_id IS NULL) as a TreeNode.
+/// Returns an error if there is no root.
+pub fn load_root(conn: &Connection) -> Result<TreeNode> {
+    let (id, name, disk_size, logical_size, file_count, created_at, modified_at): (
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT id, name, total_disk_size, total_logical_size, total_file_count,
+                created_at, modified_at
+         FROM dirs
+         WHERE parent_id IS NULL
+         LIMIT 1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+
+    Ok(TreeNode {
+        id,
+        name,
+        is_dir: true,
+        disk_size: disk_size as u64,
+        logical_size: logical_size as u64,
+        file_count: file_count as u64,
+        created_at,
+        modified_at,
+        extension: None,
+        children: Vec::new(),
+    })
+}
+
+/// Return the immediate children (sub-dirs + files) of `dir_id`, sorted by
+/// disk_size descending.
+pub fn load_children(conn: &Connection, dir_id: i64) -> Result<Vec<TreeNode>> {
+    // Sub-directories
+    let mut children: Vec<TreeNode> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, total_disk_size, total_logical_size, total_file_count,
+                    created_at, modified_at
+             FROM dirs
+             WHERE parent_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![dir_id], |row| {
+            Ok(TreeNode {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                is_dir: true,
+                disk_size: row.get::<_, i64>(2)? as u64,
+                logical_size: row.get::<_, i64>(3)? as u64,
+                file_count: row.get::<_, i64>(4)? as u64,
+                created_at: row.get(5)?,
+                modified_at: row.get(6)?,
+                extension: None,
+                children: Vec::new(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Direct files
+    let file_nodes: Vec<TreeNode> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, disk_size, logical_size,
+                    created_at, modified_at, extension
+             FROM files
+             WHERE dir_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![dir_id], |row| {
+            Ok(TreeNode {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                is_dir: false,
+                disk_size: row.get::<_, i64>(2)? as u64,
+                logical_size: row.get::<_, i64>(3)? as u64,
+                file_count: 0,
+                created_at: row.get(4)?,
+                modified_at: row.get(5)?,
+                extension: row.get(6)?,
+                children: Vec::new(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    children.extend(file_nodes);
+    // Sort by disk_size descending
+    children.sort_by(|a, b| b.disk_size.cmp(&a.disk_size));
+    Ok(children)
+}
+
+// ---------------------------------------------------------------------------
+// File queries
+// ---------------------------------------------------------------------------
+
+/// Return files whose disk_size >= `min_size`, sorted by disk_size DESC,
+/// limited to `limit` rows. full_path is reconstructed.
+pub fn query_large_files(
+    conn: &Connection,
+    min_size: u64,
+    limit: usize,
+) -> Result<Vec<FileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.dir_id, f.name, f.disk_size, f.logical_size,
+                f.created_at, f.modified_at, f.extension
+         FROM files f
+         WHERE f.disk_size >= ?1
+         ORDER BY f.disk_size DESC
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![min_size as i64, limit as i64],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,  // dir_id
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        },
+    )?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let (dir_id, name, disk_size, logical_size, created_at, modified_at, extension) = row?;
+        let dir_path = reconstruct_path(conn, dir_id)?;
+        let full_path = format!("{}/{}", dir_path, name);
+        result.push(FileRow {
+            name,
+            full_path,
+            disk_size,
+            logical_size,
+            created_at,
+            modified_at,
+            extension,
+        });
+    }
+    Ok(result)
+}
+
+/// Return files modified after `after_timestamp`, sorted by modified_at DESC,
+/// limited to `limit` rows.
+pub fn query_recent_files(
+    conn: &Connection,
+    after_timestamp: i64,
+    limit: usize,
+) -> Result<Vec<FileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.dir_id, f.name, f.disk_size, f.logical_size,
+                f.created_at, f.modified_at, f.extension
+         FROM files f
+         WHERE f.modified_at > ?1
+         ORDER BY f.modified_at DESC
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![after_timestamp, limit as i64],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        },
+    )?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let (dir_id, name, disk_size, logical_size, created_at, modified_at, extension) = row?;
+        let dir_path = reconstruct_path(conn, dir_id)?;
+        let full_path = format!("{}/{}", dir_path, name);
+        result.push(FileRow {
+            name,
+            full_path,
+            disk_size,
+            logical_size,
+            created_at,
+            modified_at,
+            extension,
+        });
+    }
+    Ok(result)
+}
+
+/// Return files modified before `before_timestamp`, sorted by disk_size DESC,
+/// limited to `limit` rows.
+pub fn query_old_files(
+    conn: &Connection,
+    before_timestamp: i64,
+    limit: usize,
+) -> Result<Vec<FileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.dir_id, f.name, f.disk_size, f.logical_size,
+                f.created_at, f.modified_at, f.extension
+         FROM files f
+         WHERE f.modified_at < ?1
+         ORDER BY f.disk_size DESC
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![before_timestamp, limit as i64],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        },
+    )?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let (dir_id, name, disk_size, logical_size, created_at, modified_at, extension) = row?;
+        let dir_path = reconstruct_path(conn, dir_id)?;
+        let full_path = format!("{}/{}", dir_path, name);
+        result.push(FileRow {
+            name,
+            full_path,
+            disk_size,
+            logical_size,
+            created_at,
+            modified_at,
+            extension,
+        });
+    }
+    Ok(result)
+}
+
+/// Return directories whose name matches a well-known dev artifact pattern.
+pub fn query_dev_artifacts(conn: &Connection) -> Result<Vec<TreeNode>> {
+    const ARTIFACT_NAMES: &[&str] = &[
+        "node_modules",
+        "target",
+        ".next",
+        "__pycache__",
+        ".build",
+        "Pods",
+        ".gradle",
+        "build",
+        "dist",
+        ".cache",
+        ".parcel-cache",
+        ".turbo",
+        "vendor",
+    ];
+
+    let placeholders: String = ARTIFACT_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT id, name, total_disk_size, total_logical_size, total_file_count,
+                created_at, modified_at
+         FROM dirs
+         WHERE name IN ({})
+         ORDER BY total_disk_size DESC",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    // Build the params dynamically using rusqlite's raw parameter binding
+    let params: Vec<&dyn rusqlite::types::ToSql> = ARTIFACT_NAMES
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(TreeNode {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            is_dir: true,
+            disk_size: row.get::<_, i64>(2)? as u64,
+            logical_size: row.get::<_, i64>(3)? as u64,
+            file_count: row.get::<_, i64>(4)? as u64,
+            created_at: row.get(5)?,
+            modified_at: row.get(6)?,
+            extension: None,
+            children: Vec::new(),
+        })
+    })?;
+
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::schema::{create_tables, open_memory_db};
+    use crate::cache::writer::{CacheWriter, DirEntry, FileEntry};
+
+    /// Build the shared test DB:
+    ///   home/ (id=1)  ← root
+    ///     projects/ (id=2)
+    ///       node_modules/ (id=3)
+    ///         react.js  (2 MB, modified_at=1000)
+    ///       old.log    (100 KB, modified_at=100)
+    ///     big.zip      (500 MB, modified_at=9000)
+    fn setup_db() -> Connection {
+        let conn = open_memory_db().unwrap();
+        create_tables(&conn).unwrap();
+
+        // We need a mutable conn for the writer; use a local mut binding.
+        let mut conn = conn;
+
+        {
+            let mut w = CacheWriter::new(&mut conn, 100);
+
+            w.add_dir(DirEntry {
+                id: 1,
+                parent_id: None,
+                name: "home".into(),
+                created_at: None,
+                modified_at: None,
+            })
+            .unwrap();
+            w.add_dir(DirEntry {
+                id: 2,
+                parent_id: Some(1),
+                name: "projects".into(),
+                created_at: None,
+                modified_at: None,
+            })
+            .unwrap();
+            w.add_dir(DirEntry {
+                id: 3,
+                parent_id: Some(2),
+                name: "node_modules".into(),
+                created_at: None,
+                modified_at: None,
+            })
+            .unwrap();
+
+            const MB: i64 = 1024 * 1024;
+            const KB: i64 = 1024;
+
+            w.add_file(FileEntry {
+                id: 1,
+                dir_id: 1,
+                name: "big.zip".into(),
+                logical_size: 500 * MB,
+                disk_size: 500 * MB,
+                created_at: None,
+                modified_at: Some(9000),
+                extension: Some("zip".into()),
+                inode: None,
+                content_hash: None,
+            })
+            .unwrap();
+            w.add_file(FileEntry {
+                id: 2,
+                dir_id: 2,
+                name: "old.log".into(),
+                logical_size: 100 * KB,
+                disk_size: 100 * KB,
+                created_at: None,
+                modified_at: Some(100),
+                extension: Some("log".into()),
+                inode: None,
+                content_hash: None,
+            })
+            .unwrap();
+            w.add_file(FileEntry {
+                id: 3,
+                dir_id: 3,
+                name: "react.js".into(),
+                logical_size: 2 * MB,
+                disk_size: 2 * MB,
+                created_at: None,
+                modified_at: Some(1000),
+                extension: Some("js".into()),
+                inode: None,
+                content_hash: None,
+            })
+            .unwrap();
+
+            w.finalize().unwrap();
+        }
+
+        conn
+    }
+
+    #[test]
+    fn test_load_root_returns_home() -> Result<()> {
+        let conn = setup_db();
+        let root = load_root(&conn)?;
+        assert_eq!(root.name, "home");
+        assert!(root.disk_size > 0, "root disk_size should be > 0 after rollup");
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_children_of_root() -> Result<()> {
+        let conn = setup_db();
+        let children = load_children(&conn, 1)?;
+
+        // Should have exactly 2 children: "projects" dir + "big.zip" file
+        assert_eq!(children.len(), 2);
+
+        let names: Vec<&str> = children.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"projects"), "expected 'projects' in children");
+        assert!(names.contains(&"big.zip"), "expected 'big.zip' in children");
+
+        // big.zip (500 MB) is larger than projects, so it should come first
+        assert_eq!(children[0].name, "big.zip");
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_large_files_above_1mb() -> Result<()> {
+        let conn = setup_db();
+        const MB: u64 = 1024 * 1024;
+
+        let files = query_large_files(&conn, MB, 100)?;
+
+        // big.zip (500 MB) and react.js (2 MB) are above 1 MB; old.log (100 KB) is not
+        assert_eq!(files.len(), 2);
+
+        // Sorted by size desc: big.zip first
+        assert_eq!(files[0].name, "big.zip");
+        assert_eq!(files[1].name, "react.js");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_recent_files_after_5000() -> Result<()> {
+        let conn = setup_db();
+
+        let files = query_recent_files(&conn, 5000, 100)?;
+
+        // Only big.zip has modified_at=9000 > 5000
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "big.zip");
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_old_files_before_500() -> Result<()> {
+        let conn = setup_db();
+
+        let files = query_old_files(&conn, 500, 100)?;
+
+        // Only old.log has modified_at=100 < 500
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "old.log");
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_dev_artifacts() -> Result<()> {
+        let conn = setup_db();
+
+        let artifacts = query_dev_artifacts(&conn)?;
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "node_modules");
+        Ok(())
+    }
+
+    #[test]
+    fn test_reconstruct_path() -> Result<()> {
+        let conn = setup_db();
+
+        let path = reconstruct_path(&conn, 3)?;
+        assert_eq!(path, "home/projects/node_modules");
+        Ok(())
+    }
+}

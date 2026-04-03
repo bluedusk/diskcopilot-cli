@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 
 /// A node in the directory tree, representing either a directory or a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TreeNode {
     pub id: i64,
     pub name: String,
@@ -17,25 +18,67 @@ pub struct TreeNode {
     pub disk_size: u64,
     pub logical_size: u64,
     pub file_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TreeNode>,
     /// For files: the directory ID containing this file (used to reconstruct full path).
     /// For directories: `None` (they use their own `id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dir_id: Option<i64>,
 }
 
 /// A flat file row with a reconstructed full path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileRow {
     pub name: String,
     pub full_path: String,
     pub disk_size: u64,
     pub logical_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<String>,
+}
+
+/// Metadata written at the end of a scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanMeta {
+    pub root_path: String,
+    pub scanned_at: i64,
+    pub total_files: i64,
+    pub total_dirs: i64,
+    pub total_size: i64,
+    pub scan_duration_ms: i64,
+}
+
+pub fn load_scan_meta(conn: &Connection) -> Result<Option<ScanMeta>> {
+    let result = conn.query_row(
+        "SELECT root_path, scanned_at, total_files, total_dirs, total_size, scan_duration_ms
+         FROM scan_meta LIMIT 1",
+        [],
+        |row| {
+            Ok(ScanMeta {
+                root_path: row.get(0)?,
+                scanned_at: row.get(1)?,
+                total_files: row.get(2)?,
+                total_dirs: row.get(3)?,
+                total_size: row.get(4)?,
+                scan_duration_ms: row.get(5)?,
+            })
+        },
+    );
+    match result {
+        Ok(meta) => Ok(Some(meta)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +106,52 @@ pub fn reconstruct_path(conn: &Connection, dir_id: i64) -> Result<String> {
 
     parts.reverse();
     Ok(parts.join("/"))
+}
+
+/// Batch-reconstruct full paths for a set of `dir_id` values in a single
+/// recursive CTE query, returning a map from dir_id → full path string.
+pub fn reconstruct_paths(conn: &Connection, dir_ids: &[i64]) -> Result<HashMap<i64, String>> {
+    if dir_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Build the ancestor chain for all requested dir_ids at once.
+    // The CTE walks parent_id upward; we then group and concatenate in Rust.
+    let placeholders: String = dir_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "WITH RECURSIVE ancestors(start_id, id, name, parent_id, depth) AS (
+            SELECT d.id, d.id, d.name, d.parent_id, 0
+            FROM dirs d WHERE d.id IN ({placeholders})
+          UNION ALL
+            SELECT a.start_id, d.id, d.name, d.parent_id, a.depth + 1
+            FROM ancestors a JOIN dirs d ON d.id = a.parent_id
+        )
+        SELECT start_id, name, depth FROM ancestors ORDER BY start_id, depth DESC"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = dir_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,  // start_id
+            row.get::<_, String>(1)?, // name
+        ))
+    })?;
+
+    let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (start_id, name) = row?;
+        map.entry(start_id).or_default().push(name);
+    }
+
+    Ok(map
+        .into_iter()
+        .map(|(id, parts)| (id, parts.join("/")))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -176,9 +265,118 @@ pub fn load_children(conn: &Connection, dir_id: i64) -> Result<Vec<TreeNode>> {
     Ok(children)
 }
 
+/// Recursively load a tree of directories and files up to `max_depth` levels.
+/// depth=0 returns just the node with no children, depth=1 includes immediate children, etc.
+pub fn load_tree_to_depth(conn: &Connection, dir_id: i64, max_depth: usize) -> Result<TreeNode> {
+    // Load the directory node itself
+    let (name, disk_size, logical_size, file_count, created_at, modified_at): (
+        String,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT name, total_disk_size, total_logical_size, total_file_count, created_at, modified_at
+         FROM dirs WHERE id = ?1",
+        rusqlite::params![dir_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+
+    let mut node = TreeNode {
+        id: dir_id,
+        name,
+        is_dir: true,
+        disk_size: disk_size as u64,
+        logical_size: logical_size as u64,
+        file_count: file_count as u64,
+        created_at,
+        modified_at,
+        extension: None,
+        children: Vec::new(),
+        dir_id: None,
+    };
+
+    if max_depth > 0 {
+        let mut children = load_children(conn, dir_id)?;
+        for child in &mut children {
+            if child.is_dir {
+                *child = load_tree_to_depth(conn, child.id, max_depth - 1)?;
+            }
+        }
+        node.children = children;
+    }
+
+    Ok(node)
+}
+
 // ---------------------------------------------------------------------------
 // File queries
 // ---------------------------------------------------------------------------
+
+/// Raw file row before path reconstruction.
+struct RawFileRow {
+    dir_id: i64,
+    name: String,
+    disk_size: u64,
+    logical_size: u64,
+    created_at: Option<i64>,
+    modified_at: Option<i64>,
+    extension: Option<String>,
+}
+
+/// Resolve dir_id → full_path for a batch of raw rows in one recursive CTE.
+fn resolve_paths(conn: &Connection, raw: Vec<RawFileRow>) -> Result<Vec<FileRow>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir_ids: Vec<i64> = raw.iter().map(|r| r.dir_id).collect();
+    let path_map = reconstruct_paths(conn, &dir_ids)?;
+
+    Ok(raw
+        .into_iter()
+        .map(|r| {
+            let dir_path = path_map.get(&r.dir_id).cloned().unwrap_or_default();
+            let full_path = format!("{}/{}", dir_path, r.name);
+            FileRow {
+                name: r.name,
+                full_path,
+                disk_size: r.disk_size,
+                logical_size: r.logical_size,
+                created_at: r.created_at,
+                modified_at: r.modified_at,
+                extension: r.extension,
+            }
+        })
+        .collect())
+}
+
+fn query_raw_rows(
+    stmt: &mut rusqlite::Statement,
+    params: &[&dyn rusqlite::types::ToSql],
+) -> Result<Vec<RawFileRow>> {
+    let rows = stmt.query_map(params, |row| {
+        Ok(RawFileRow {
+            dir_id: row.get(0)?,
+            name: row.get(1)?,
+            disk_size: row.get::<_, i64>(2)? as u64,
+            logical_size: row.get::<_, i64>(3)? as u64,
+            created_at: row.get(4)?,
+            modified_at: row.get(5)?,
+            extension: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
 
 /// Return files whose disk_size >= `min_size`, sorted by disk_size DESC,
 /// limited to `limit` rows. full_path is reconstructed.
@@ -195,38 +393,10 @@ pub fn query_large_files(
          ORDER BY f.disk_size DESC
          LIMIT ?2",
     )?;
-
-    let rows = stmt.query_map(
-        rusqlite::params![min_size as i64, limit as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,  // dir_id
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        },
-    )?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        let (dir_id, name, disk_size, logical_size, created_at, modified_at, extension) = row?;
-        let dir_path = reconstruct_path(conn, dir_id)?;
-        let full_path = format!("{}/{}", dir_path, name);
-        result.push(FileRow {
-            name,
-            full_path,
-            disk_size,
-            logical_size,
-            created_at,
-            modified_at,
-            extension,
-        });
-    }
-    Ok(result)
+    let min = min_size as i64;
+    let lim = limit as i64;
+    let raw = query_raw_rows(&mut stmt, &[&min, &lim])?;
+    resolve_paths(conn, raw)
 }
 
 /// Return files modified after `after_timestamp`, sorted by modified_at DESC,
@@ -244,38 +414,9 @@ pub fn query_recent_files(
          ORDER BY f.modified_at DESC
          LIMIT ?2",
     )?;
-
-    let rows = stmt.query_map(
-        rusqlite::params![after_timestamp, limit as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        },
-    )?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        let (dir_id, name, disk_size, logical_size, created_at, modified_at, extension) = row?;
-        let dir_path = reconstruct_path(conn, dir_id)?;
-        let full_path = format!("{}/{}", dir_path, name);
-        result.push(FileRow {
-            name,
-            full_path,
-            disk_size,
-            logical_size,
-            created_at,
-            modified_at,
-            extension,
-        });
-    }
-    Ok(result)
+    let lim = limit as i64;
+    let raw = query_raw_rows(&mut stmt, &[&after_timestamp, &lim])?;
+    resolve_paths(conn, raw)
 }
 
 /// Return files modified before `before_timestamp`, sorted by disk_size DESC,
@@ -293,38 +434,9 @@ pub fn query_old_files(
          ORDER BY f.disk_size DESC
          LIMIT ?2",
     )?;
-
-    let rows = stmt.query_map(
-        rusqlite::params![before_timestamp, limit as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        },
-    )?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        let (dir_id, name, disk_size, logical_size, created_at, modified_at, extension) = row?;
-        let dir_path = reconstruct_path(conn, dir_id)?;
-        let full_path = format!("{}/{}", dir_path, name);
-        result.push(FileRow {
-            name,
-            full_path,
-            disk_size,
-            logical_size,
-            created_at,
-            modified_at,
-            extension,
-        });
-    }
-    Ok(result)
+    let lim = limit as i64;
+    let raw = query_raw_rows(&mut stmt, &[&before_timestamp, &lim])?;
+    resolve_paths(conn, raw)
 }
 
 /// Return directories whose name matches a well-known dev artifact pattern.
@@ -393,7 +505,7 @@ pub fn query_dev_artifacts(conn: &Connection) -> Result<Vec<TreeNode>> {
 // ---------------------------------------------------------------------------
 
 /// A group of files that share identical content (same blake3 hash).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DuplicateGroup {
     pub hash: String,
     pub size: u64,
@@ -850,6 +962,77 @@ mod tests {
 
         let children = load_children(&conn2, 2)?;
         assert!(children.is_empty(), "leaf directory with no children should return empty Vec");
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_scan_meta_empty() -> Result<()> {
+        let conn = open_memory_db()?;
+        create_tables(&conn)?;
+        let meta = load_scan_meta(&conn)?;
+        assert!(meta.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_scan_meta_with_data() -> Result<()> {
+        let conn = setup_db();
+        // Insert a scan_meta row
+        conn.execute(
+            "INSERT INTO scan_meta (root_path, scanned_at, total_files, total_dirs, total_size, scan_duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["/home", 1000i64, 3i64, 3i64, 502i64 * 1024 * 1024, 500i64],
+        )?;
+        let meta = load_scan_meta(&conn)?.expect("should have scan meta");
+        assert_eq!(meta.root_path, "/home");
+        assert_eq!(meta.total_files, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_tree_depth_zero() -> Result<()> {
+        let conn = setup_db();
+        let tree = load_tree_to_depth(&conn, 1, 0)?;
+        assert_eq!(tree.name, "home");
+        assert!(tree.children.is_empty(), "depth=0 should have no children");
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_tree_depth_one() -> Result<()> {
+        let conn = setup_db();
+        let tree = load_tree_to_depth(&conn, 1, 1)?;
+        assert_eq!(tree.name, "home");
+        assert_eq!(tree.children.len(), 2, "should have projects dir + big.zip");
+        // Children should not have their own children loaded
+        for child in &tree.children {
+            assert!(child.children.is_empty(), "depth=1 children should have no grandchildren");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_tree_depth_two() -> Result<()> {
+        let conn = setup_db();
+        let tree = load_tree_to_depth(&conn, 1, 2)?;
+        let projects = tree
+            .children
+            .iter()
+            .find(|c| c.name == "projects")
+            .expect("should find projects");
+        assert!(!projects.children.is_empty(), "depth=2 should load projects' children");
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialize_tree_node_json() -> Result<()> {
+        let conn = setup_db();
+        let tree = load_tree_to_depth(&conn, 1, 1)?;
+        let json = serde_json::to_string_pretty(&tree)?;
+        assert!(json.contains("\"name\""));
+        assert!(json.contains("\"disk_size\""));
+        // Empty children should be omitted due to skip_serializing_if
+        // (big.zip has no children and is not a dir, so children field is empty)
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use serde::Serialize;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -8,11 +9,12 @@ use crate::scanner::safety::is_dangerous_path;
 // Result type
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeleteResult {
     pub path: String,
     pub size_freed: u64,
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

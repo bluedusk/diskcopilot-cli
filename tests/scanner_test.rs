@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use diskcopilot::cache::schema::{create_indexes, create_tables, open_db};
 use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
 
@@ -44,7 +45,7 @@ fn test_scan_full_counts() -> anyhow::Result<()> {
         let mut writer =
             diskcopilot::cache::writer::CacheWriter::new(&mut conn, 1000);
         scan_directory(root, &config, &mut writer, &progress)?;
-        writer.finalize()?;
+        writer.finalize(&HashMap::new())?;
     }
 
     create_indexes(&conn)?;
@@ -93,7 +94,7 @@ fn test_hardlink_dedup() -> anyhow::Result<()> {
         let mut writer =
             diskcopilot::cache::writer::CacheWriter::new(&mut conn, 1000);
         scan_directory(root, &config, &mut writer, &progress)?;
-        writer.finalize()?;
+        writer.finalize(&HashMap::new())?;
     }
 
     // Only one of the two hard-linked entries should be stored in the DB

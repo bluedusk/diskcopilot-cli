@@ -138,17 +138,20 @@ impl<'conn> CacheWriter<'conn> {
     }
 
     /// Flush remaining buffers, then compute aggregated dir sizes bottom-up.
-    pub fn finalize(&mut self) -> Result<()> {
+    /// `skipped_sizes`: extra (file_count, disk_size) per dir_id for files that
+    /// were below the size threshold and not written to the files table.
+    pub fn finalize(&mut self, skipped_sizes: &HashMap<i64, (i64, i64)>) -> Result<()> {
         self.flush_dirs()?;
         self.flush_files()?;
-        self.compute_dir_sizes()?;
+        self.compute_dir_sizes(skipped_sizes)?;
         Ok(())
     }
 
     /// Bottom-up aggregation using a Rust-side topological sort:
     /// 1. Set each dir's direct file_count/sizes from its own files.
+    /// 1b. Add skipped file sizes (below threshold) to direct counts.
     /// 2. Load dir topology, sort leaves-first, then roll up into parents.
-    pub fn compute_dir_sizes(&mut self) -> Result<()> {
+    pub fn compute_dir_sizes(&mut self, skipped_sizes: &HashMap<i64, (i64, i64)>) -> Result<()> {
         // Step 1: direct file stats — only update dirs that have files.
         // Aggregate into temp table, then JOIN-update only matching dirs.
         self.conn.execute_batch(
@@ -170,6 +173,23 @@ impl<'conn> CacheWriter<'conn> {
 
              DROP TABLE dir_direct;",
         )?;
+
+        // Step 1b: add sizes of files that were below the min-size threshold.
+        // These files don't have records in the files table, but their sizes
+        // must still be counted in directory totals.
+        if !skipped_sizes.is_empty() {
+            let mut stmt = self.conn.prepare_cached(
+                "UPDATE dirs SET
+                    file_count         = COALESCE(file_count, 0) + ?2,
+                    total_file_count   = COALESCE(total_file_count, 0) + ?2,
+                    total_logical_size = COALESCE(total_logical_size, 0) + ?3,
+                    total_disk_size    = COALESCE(total_disk_size, 0) + ?3
+                 WHERE id = ?1",
+            )?;
+            for (&dir_id, &(count, size)) in skipped_sizes {
+                stmt.execute(rusqlite::params![dir_id, count, size])?;
+            }
+        }
         // Step 2: load dir topology into Rust for fast rollup.
         let rows: Vec<(i64, Option<i64>, i64, i64, i64)> = {
             let mut stmt = self.conn.prepare(
@@ -329,7 +349,7 @@ mod tests {
             extension: Some("bin".into()), inode: None, content_hash: None,
         })?;
 
-        w.finalize()?;
+        w.finalize(&HashMap::new())?;
 
         // Verify child dir
         let (child_fc, child_tfc, child_ls, child_ds): (i64, i64, i64, i64) =
@@ -440,7 +460,7 @@ mod tests {
             extension: Some("bin".into()), inode: None, content_hash: None,
         })?;
 
-        w.finalize()?;
+        w.finalize(&HashMap::new())?;
 
         let root_ds: i64 = conn.query_row(
             "SELECT total_disk_size FROM dirs WHERE id = 1",

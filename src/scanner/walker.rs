@@ -100,7 +100,7 @@ pub fn scan_directory(
     config: &ScanConfig,
     writer: &mut CacheWriter<'_>,
     progress: &ScanProgress,
-) -> Result<()> {
+) -> Result<HashMap<i64, (i64, i64)>> {
     let min_file_size = config.min_file_size;
     let full = config.full;
 
@@ -119,6 +119,14 @@ pub fn scan_directory(
     let bundles: Arc<std::sync::Mutex<BundleVec>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let bundles_ref = bundles.clone();
+
+    // Small files (below min_file_size) skipped in process_read_dir.
+    // Their sizes are accumulated here so directory totals remain accurate.
+    // Tuple: (parent_path, disk_size, logical_size)
+    type SkippedVec = Vec<(PathBuf, u64, u64)>;
+    let skipped_files: Arc<std::sync::Mutex<SkippedVec>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let skipped_ref = skipped_files.clone();
 
     // Phase 1: parallel stat via process_read_dir.
     // File metadata (stat syscall) is computed on jwalk's rayon thread pool,
@@ -206,8 +214,11 @@ pub fn scan_directory(
                         Err(_) => return false,
                     };
 
-                    // Skip small files early (in parallel) if not full mode
+                    // Skip small files from DB but track their sizes for dir totals
                     if !full && stat.logical_size < min_file_size {
+                        if let Ok(mut s) = skipped_ref.lock() {
+                            s.push((entry.parent_path.to_path_buf(), stat.disk_size, stat.logical_size));
+                        }
                         return false;
                     }
 
@@ -332,6 +343,26 @@ pub fn scan_directory(
         progress.total_size.fetch_add(disk_size, Ordering::Relaxed);
     }
 
+    // Build skipped sizes map from the parallel-collected vec.
+    let mut skipped_map: HashMap<i64, (i64, i64)> = HashMap::new();
+    let skipped_vec = std::mem::take(&mut *skipped_files.lock().unwrap());
+    for (parent_path, disk_size, _logical_size) in skipped_vec {
+        if let Some(&dir_id) = path_to_dir_id.get(&parent_path) {
+            let entry = skipped_map.entry(dir_id).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += disk_size as i64;
+
+            // Also mark this dir and ancestors as needed
+            if let Some(&idx) = path_to_idx.get(&parent_path) {
+                let mut cur = Some(idx);
+                while let Some(i) = cur {
+                    if !needed_dirs.insert(i) { break; }
+                    cur = dir_records[i].parent_idx;
+                }
+            }
+        }
+    }
+
     // Write only dirs that contain files (directly or via descendants)
     for (idx, d) in dir_records.iter().enumerate() {
         if !needed_dirs.contains(&idx) {
@@ -348,7 +379,7 @@ pub fn scan_directory(
         })?;
     }
 
-    Ok(())
+    Ok(skipped_map)
 }
 
 #[cfg(test)]
@@ -385,7 +416,7 @@ mod tests {
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
             scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize()?;
+            writer.finalize(&HashMap::new())?;
         }
 
         assert_eq!(progress.files(), 2, "should find 2 files");
@@ -420,7 +451,7 @@ mod tests {
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
             scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize()?;
+            writer.finalize(&HashMap::new())?;
         }
 
         // Only real.txt should be indexed (link is skipped)
@@ -442,7 +473,7 @@ mod tests {
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
             scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize()?;
+            writer.finalize(&HashMap::new())?;
         }
 
         assert_eq!(progress.dirs(), 1, "should find 1 dir (root only)");
@@ -484,7 +515,7 @@ mod tests {
         let result = {
             let mut writer = CacheWriter::new(&mut conn, 1000);
             let r = scan_directory(root, &config, &mut writer, &progress);
-            writer.finalize()?;
+            writer.finalize(&HashMap::new())?;
             r
         };
 
@@ -517,7 +548,7 @@ mod tests {
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
             scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize()?;
+            writer.finalize(&HashMap::new())?;
         }
 
         // Only big.bin passes the filter

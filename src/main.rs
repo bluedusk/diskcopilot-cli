@@ -16,6 +16,8 @@ use diskcopilot::server;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+#[allow(unused_imports)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -300,26 +302,21 @@ async fn run_scan(
         // On macOS, prefer the getattrlistbulk-based scanner (3-6x faster on APFS).
         // Fall back to the jwalk-based scanner for non-APFS volumes (exFAT, FAT32, NTFS).
         #[cfg(target_os = "macos")]
-        let used_bulk = if supports_bulk_attrs(&path) {
-            scan_directory_bulk(&path, &config, &mut cache_writer, &progress)?;
-            true
+        let skipped_sizes = if supports_bulk_attrs(&path) {
+            scan_directory_bulk(&path, &config, &mut cache_writer, &progress)?
         } else {
-            scan_directory(&path, &config, &mut cache_writer, &progress)?;
-            false
+            scan_directory(&path, &config, &mut cache_writer, &progress)?
         };
 
         #[cfg(not(target_os = "macos"))]
-        let used_bulk = {
-            scan_directory(&path, &config, &mut cache_writer, &progress)?;
-            false
+        let skipped_sizes = {
+            scan_directory(&path, &config, &mut cache_writer, &progress)?
         };
-
-        let _ = used_bulk; // suppress unused-variable warning in some cfg combinations
 
         cache_writer.commit()?;
 
         // 7. Finalize (flush buffers + compute dir size rollups)
-        cache_writer.finalize()?;
+        cache_writer.finalize(&skipped_sizes)?;
         // cache_writer (and its &mut conn borrow) drops here
     }
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;

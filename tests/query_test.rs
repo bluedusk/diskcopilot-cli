@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use diskcopilot::cache::reader::{load_root, load_scan_meta, load_tree_to_depth, query_large_files};
 use diskcopilot::cache::schema::{create_indexes, create_tables, open_memory_db};
 use diskcopilot::cache::writer::{CacheWriter, ScanMeta};
@@ -24,7 +25,7 @@ fn test_query_json_roundtrip() -> anyhow::Result<()> {
     {
         let mut writer = CacheWriter::new(&mut conn, 1000);
         scan_directory(root, &config, &mut writer, &progress)?;
-        writer.finalize()?;
+        writer.finalize(&HashMap::new())?;
         writer.write_meta(&ScanMeta {
             root_path: root.to_string_lossy().into_owned(),
             scanned_at: 1000,

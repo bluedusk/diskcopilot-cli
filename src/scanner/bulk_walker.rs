@@ -355,7 +355,9 @@ fn is_bundle_name(name: &str) -> bool {
 /// Owned config that can be shared across rayon worker threads via Arc.
 struct WalkConfig {
     root_dev: i32,
+    #[allow(dead_code)]
     min_size: u64,
+    #[allow(dead_code)]
     full: bool,
     excluded: Vec<PathBuf>,
 }
@@ -449,10 +451,10 @@ fn process_directory(
                     0
                 };
 
-                // Apply size filter unless in full mode
-                if cfg.full || alloc >= cfg.min_size {
-                    children.push((entry.name, alloc, false, Some(entry.mtime_sec), Some(entry.crtime_sec)));
-                }
+                // Always include file for accurate directory size rollups.
+                // The DB writer decides whether to write the individual file record
+                // based on the size threshold.
+                children.push((entry.name, alloc, false, Some(entry.mtime_sec), Some(entry.crtime_sec)));
             }
 
             _ => continue,
@@ -515,7 +517,7 @@ pub fn scan_directory_bulk(
     config: &ScanConfig,
     writer: &mut CacheWriter<'_>,
     progress: &ScanProgress,
-) -> Result<()> {
+) -> Result<HashMap<i64, (i64, i64)>> {
     // Detect root filesystem device for cross-device mount filtering
     let root_dev: i32 = {
         use std::os::unix::fs::MetadataExt;
@@ -699,13 +701,20 @@ pub fn scan_directory_bulk(
     let mut needed_dirs: HashSet<usize> = HashSet::new();
     let mut file_id_counter: i64 = 0;
 
+    let write_all_files = config.full || config.min_file_size == 0;
+
+    // Track size of small files (below threshold) per directory.
+    // These won't have file records in the DB but their sizes must still
+    // roll up into directory totals for accurate reporting.
+    let mut skipped_size_per_dir: HashMap<i64, (i64, i64)> = HashMap::new(); // dir_id -> (count, disk_size)
+
     for pf in &pending_files {
         let dir_id = match path_to_dir_id.get(&pf.dir_path) {
             Some(&id) => id,
             None => continue, // orphan — parent dir was never registered
         };
 
-        // Mark this dir and all ancestors as needed.
+        // Mark this dir and all ancestors as needed (regardless of file size).
         if let Some(&idx) = path_to_idx.get(&pf.dir_path) {
             let mut cur = Some(idx);
             while let Some(i) = cur {
@@ -716,21 +725,27 @@ pub fn scan_directory_bulk(
             }
         }
 
-        let ext = file_extension(&pf.name);
-        file_id_counter += 1;
-        writer.add_file(FileEntry {
-            id: file_id_counter,
-            dir_id,
-            name: pf.name.clone(),
-            // getattrlistbulk reports allocation size; use it for both fields.
-            logical_size: pf.alloc_size as i64,
-            disk_size: pf.alloc_size as i64,
-            created_at: pf.created_at,
-            modified_at: pf.modified_at,
-            extension: ext,
-            inode: None,
-            content_hash: None,
-        })?;
+        if write_all_files || pf.alloc_size >= config.min_file_size {
+            let ext = file_extension(&pf.name);
+            file_id_counter += 1;
+            writer.add_file(FileEntry {
+                id: file_id_counter,
+                dir_id,
+                name: pf.name.clone(),
+                logical_size: pf.alloc_size as i64,
+                disk_size: pf.alloc_size as i64,
+                created_at: pf.created_at,
+                modified_at: pf.modified_at,
+                extension: ext,
+                inode: None,
+                content_hash: None,
+            })?;
+        } else {
+            // File is below threshold — don't write a record, but track its size.
+            let entry = skipped_size_per_dir.entry(dir_id).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += pf.alloc_size as i64;
+        }
     }
 
     // Write only dirs that contain files.
@@ -747,5 +762,5 @@ pub fn scan_directory_bulk(
         })?;
     }
 
-    Ok(())
+    Ok(skipped_size_per_dir)
 }

@@ -856,7 +856,7 @@ mod tests {
             })
             .unwrap();
 
-            w.finalize().unwrap();
+            w.finalize(&HashMap::new()).unwrap();
         }
 
         conn
@@ -1028,7 +1028,7 @@ mod tests {
                 content_hash: None,
             })?;
 
-            w.finalize()?;
+            w.finalize(&HashMap::new())?;
         }
 
         let mut progress_calls = Vec::new();
@@ -1082,7 +1082,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
             })?;
-            w.finalize()?;
+            w.finalize(&HashMap::new())?;
         }
 
         let children = load_children(&conn2, 2)?;

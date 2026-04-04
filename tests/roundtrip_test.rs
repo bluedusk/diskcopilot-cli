@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use diskcopilot::cache::reader::{load_children, load_root, query_large_files};
 use diskcopilot::cache::schema::{create_indexes, create_tables, open_memory_db};
 use diskcopilot::cache::writer::CacheWriter;
@@ -37,7 +38,7 @@ fn test_scan_and_read_roundtrip() -> anyhow::Result<()> {
     {
         let mut writer = CacheWriter::new(&mut conn, 1000);
         scan_directory(root, &config, &mut writer, &progress)?;
-        writer.finalize()?;
+        writer.finalize(&HashMap::new())?;
     }
     create_indexes(&conn)?;
 

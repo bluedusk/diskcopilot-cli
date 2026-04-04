@@ -16,14 +16,19 @@ Designed for two consumers:
 ## Install
 
 ```bash
-# From source
-cargo install --path .
+# One-line install (Apple Silicon)
+curl -fsSL https://github.com/bluedusk/diskcopilot-cli/releases/latest/download/diskcopilot-cli-aarch64-apple-darwin.tar.gz | tar xz && sudo mv diskcopilot-cli /usr/local/bin/
 
-# Or via Makefile
-make install
+# Intel Mac
+curl -fsSL https://github.com/bluedusk/diskcopilot-cli/releases/latest/download/diskcopilot-cli-x86_64-apple-darwin.tar.gz | tar xz && sudo mv diskcopilot-cli /usr/local/bin/
 ```
 
-Requires Rust 1.70+.
+Or build from source (requires Rust 1.70+):
+
+```bash
+git clone https://github.com/bluedusk/diskcopilot-cli
+cd diskcopilot-cli && make install
+```
 
 ## Usage
 

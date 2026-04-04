@@ -362,6 +362,9 @@ async fn run_scan(
     println!("  \x1b[1mTime:\x1b[0m    \x1b[36m{:.2}s\x1b[0m ({:.0} files/s)", secs, rate);
     println!("  \x1b[1mCache:\x1b[0m   {} \x1b[90m({})\x1b[0m", format_size(db_size), db_path.display());
 
+    // Print rich post-scan report
+    output::print_scan_report(&conn);
+
     // Show disk context for root/drive scans
     #[cfg(target_os = "macos")]
     {

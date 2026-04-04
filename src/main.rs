@@ -365,6 +365,11 @@ async fn run_scan(
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     println!("\n\x1b[1;32m✓ Scan complete\x1b[0m");
+    if full {
+        println!("  \x1b[1mMode:\x1b[0m    Full (all files)");
+    } else {
+        println!("  \x1b[1mMode:\x1b[0m    Default (files >= {}) \x1b[90m— directory sizes are accurate, use --full for small file queries\x1b[0m", format_size(min_file_size));
+    }
     println!("  \x1b[1mFiles:\x1b[0m   \x1b[33m{}\x1b[0m", files);
     println!("  \x1b[1mDirs:\x1b[0m    \x1b[33m{}\x1b[0m", dirs);
     println!("  \x1b[1mSize:\x1b[0m    \x1b[32m{}\x1b[0m", size);

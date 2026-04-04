@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use crate::safelist;
 use crate::scanner::safety::is_dangerous_path;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +56,10 @@ pub fn move_to_trash(path: &str) -> Result<DeleteResult> {
         bail!("Refusing to trash dangerous path: {}", path);
     }
 
+    if safelist::is_protected(p) {
+        bail!("Protected by safelist: {}. Run 'diskcopilot-cli unkeep {}' to remove protection.", path, path);
+    }
+
     let size_freed = calc_size(p);
 
     match trash::delete(p) {
@@ -83,6 +88,10 @@ pub fn delete_permanent(path: &str) -> Result<DeleteResult> {
 
     if is_dangerous_path(p) {
         bail!("Refusing to permanently delete dangerous path: {}", path);
+    }
+
+    if safelist::is_protected(p) {
+        bail!("Protected by safelist: {}. Run 'diskcopilot-cli unkeep {}' to remove protection.", path, path);
     }
 
     let size_freed = calc_size(p);

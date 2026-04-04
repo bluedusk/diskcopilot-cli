@@ -12,6 +12,7 @@ use diskcopilot::scanner::walker::{scan_directory, ScanConfig, ScanProgress};
 #[cfg(target_os = "macos")]
 use diskcopilot::scanner::bulk_walker::{scan_directory_bulk, supports_bulk_attrs};
 use diskcopilot::output;
+use diskcopilot::safelist;
 use diskcopilot::server;
 
 use clap::{Parser, Subcommand};
@@ -93,6 +94,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Mark a file or folder as important (excluded from cleanup recommendations)
+    Keep {
+        /// Path to protect
+        path: PathBuf,
+    },
+
+    /// Remove a file or folder from the safelist
+    Unkeep {
+        /// Path to unprotect
+        path: PathBuf,
+    },
+
+    /// Show all safelist entries
+    KeepList,
 
     /// Start interactive cleanup web UI
     Serve {
@@ -667,6 +683,30 @@ async fn main() -> anyhow::Result<()> {
                 insights
             };
             server::serve(path, port, insights_content).await
+        }
+        Commands::Keep { path } => {
+            safelist::add(&path)?;
+            println!("  Protected: {}", path.display());
+            Ok(())
+        }
+        Commands::Unkeep { path } => {
+            safelist::remove(&path)?;
+            println!("  Removed from safelist: {}", path.display());
+            Ok(())
+        }
+        Commands::KeepList => {
+            let entries = safelist::load()?;
+            if entries.is_empty() {
+                println!("  Safelist is empty. Use 'diskcopilot-cli keep <path>' to protect files.");
+            } else {
+                println!("  Protected files/folders:");
+                let mut sorted: Vec<_> = entries.iter().collect();
+                sorted.sort();
+                for p in sorted {
+                    println!("    {}", p.display());
+                }
+            }
+            Ok(())
         }
     }
 }

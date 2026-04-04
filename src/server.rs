@@ -113,7 +113,7 @@ async fn api_large_files(
     let min_size = params.min_size.unwrap_or(100_000_000); // 100 MB default
     let limit = params.limit.unwrap_or(50);
     match reader::query_large_files(&conn, min_size, limit) {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(filter_existing(rows)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -125,11 +125,14 @@ async fn api_dev_artifacts(State(state): State<Arc<AppState>>) -> impl IntoRespo
     };
     match reader::query_dev_artifacts(&conn) {
         Ok(rows) => {
-            // Resolve full paths for dev artifacts
+            // Resolve full paths for dev artifacts, filter out deleted ones
             let mut result: Vec<serde_json::Value> = Vec::new();
             for node in &rows {
                 let full_path = reader::reconstruct_path(&conn, node.id)
                     .unwrap_or_else(|_| node.name.clone());
+                if !std::path::Path::new(&full_path).exists() {
+                    continue;
+                }
                 let mut val = serde_json::to_value(node).unwrap_or_default();
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert("full_path".to_string(), serde_json::Value::String(full_path));
@@ -158,7 +161,7 @@ async fn api_old_files(
         .unwrap_or(0);
     let cutoff = now - (days as i64 * 86400);
     match reader::query_old_files(&conn, cutoff, limit) {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(filter_existing(rows)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -255,6 +258,13 @@ async fn api_trash(
 
 fn open_db(db_path: &Path) -> Result<rusqlite::Connection, String> {
     schema::open_db(db_path).map_err(|e| format!("Failed to open cache: {}", e))
+}
+
+/// Filter out files that no longer exist on disk.
+fn filter_existing(rows: Vec<reader::FileRow>) -> Vec<reader::FileRow> {
+    rows.into_iter()
+        .filter(|r| std::path::Path::new(&r.full_path).exists())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

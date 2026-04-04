@@ -21,7 +21,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "diskcopilot-cli", about = "Fast Mac disk scanner and query tool")]
+#[command(
+    name = "diskcopilot-cli",
+    about = "Fast Mac disk scanner and query tool",
+    after_help = "\x1b[1mExamples:\x1b[0m
+  diskcopilot-cli scan ~                           Scan home directory
+  diskcopilot-cli scan ~ --full                    Scan all files (no size threshold)
+  diskcopilot-cli query tree ~ --depth 2           Directory size tree
+  diskcopilot-cli query large-files ~ --json       Largest files as JSON
+  diskcopilot-cli query dev-artifacts ~            Find node_modules, target, etc.
+  diskcopilot-cli query sql \"SELECT ...\" ~         Raw SQL query
+  diskcopilot-cli serve ~                          Open cleanup dashboard in browser
+  diskcopilot-cli delete ~/old-file.zip --trash    Move to Trash"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

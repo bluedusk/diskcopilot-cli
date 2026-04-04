@@ -216,7 +216,27 @@ async fn api_trash(
         return e.into_response();
     }
     match trash::move_to_trash(&body.path) {
-        Ok(result) => Json(result).into_response(),
+        Ok(result) => {
+            // Remove trashed item from the cache so the UI stays in sync.
+            if result.success {
+                if let Ok(conn) = open_db(&state.db_path) {
+                    let name = std::path::Path::new(&body.path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    // Try deleting as a file first, then as a directory
+                    let _ = conn.execute(
+                        "DELETE FROM files WHERE name = ?1 AND disk_size = ?2",
+                        rusqlite::params![name, result.size_freed as i64],
+                    );
+                    let _ = conn.execute(
+                        "DELETE FROM dirs WHERE name = ?1 AND total_disk_size = ?2",
+                        rusqlite::params![name, result.size_freed as i64],
+                    );
+                }
+            }
+            Json(result).into_response()
+        }
         Err(e) => {
             let result = trash::DeleteResult {
                 path: body.path,

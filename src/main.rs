@@ -585,8 +585,8 @@ fn run_query(command: QueryCommand) -> anyhow::Result<()> {
             let conn = open_cache(&path)?;
             // Only allow read-only queries
             let q = query.trim().to_uppercase();
-            if !q.starts_with("SELECT") && !q.starts_with("WITH") && !q.starts_with("PRAGMA") {
-                anyhow::bail!("Only SELECT, WITH, and PRAGMA statements are allowed");
+            if !q.starts_with("SELECT") && !q.starts_with("WITH") {
+                anyhow::bail!("Only SELECT and WITH statements are allowed");
             }
             let mut stmt = conn.prepare(&query)?;
             let col_count = stmt.column_count();

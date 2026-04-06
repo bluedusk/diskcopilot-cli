@@ -6,9 +6,10 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 use crate::cache::{self, reader, schema};
 use crate::delete::trash;
@@ -223,19 +224,7 @@ async fn api_trash(
             // Remove trashed item from the cache so the UI stays in sync.
             if result.success {
                 if let Ok(conn) = open_db(&state.db_path) {
-                    let name = std::path::Path::new(&body.path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    // Try deleting as a file first, then as a directory
-                    let _ = conn.execute(
-                        "DELETE FROM files WHERE name = ?1 AND disk_size = ?2",
-                        rusqlite::params![name, result.size_freed as i64],
-                    );
-                    let _ = conn.execute(
-                        "DELETE FROM dirs WHERE name = ?1 AND total_disk_size = ?2",
-                        rusqlite::params![name, result.size_freed as i64],
-                    );
+                    remove_from_cache(&conn, &body.path);
                 }
             }
             Json(result).into_response()
@@ -267,6 +256,85 @@ fn filter_existing(rows: Vec<reader::FileRow>) -> Vec<reader::FileRow> {
         .collect()
 }
 
+/// Remove a trashed path from the SQLite cache by walking path components to find the
+/// correct dir_id, then deleting by dir_id + name.  Silently skips on lookup failure
+/// (the file is already gone from disk; stale cache rows are harmless).
+fn remove_from_cache(conn: &rusqlite::Connection, path: &str) {
+    let p = std::path::Path::new(path);
+    let name = match p.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let parent = match p.parent() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Walk the path components from the root downward through the dirs table.
+    let components: Vec<&str> = parent
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            std::path::Component::RootDir => Some("/"),
+            _ => None,
+        })
+        .collect();
+
+    // Find the root dir (parent_id IS NULL) whose name matches the first component.
+    let first = match components.first() {
+        Some(c) => *c,
+        None => return,
+    };
+    let root_id: i64 = match conn.query_row(
+        "SELECT id FROM dirs WHERE parent_id IS NULL AND name = ?1",
+        rusqlite::params![first],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    // Walk the remaining components.
+    let mut current_id = root_id;
+    for component in components.iter().skip(1) {
+        if *component == "/" {
+            continue;
+        }
+        let child_id: i64 = match conn.query_row(
+            "SELECT id FROM dirs WHERE parent_id = ?1 AND name = ?2",
+            rusqlite::params![current_id, component],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        current_id = child_id;
+    }
+
+    // current_id is now the dir_id of the parent directory.
+    // Try deleting as a file first.
+    let deleted = conn
+        .execute(
+            "DELETE FROM files WHERE dir_id = ?1 AND name = ?2",
+            rusqlite::params![current_id, name],
+        )
+        .unwrap_or(0);
+
+    // If no file row was removed, try treating it as a directory.
+    if deleted == 0 {
+        let dir_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM dirs WHERE parent_id = ?1 AND name = ?2",
+                rusqlite::params![current_id, name],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(did) = dir_id {
+            let _ = conn.execute("DELETE FROM dirs WHERE id = ?1", rusqlite::params![did]);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -288,15 +356,15 @@ pub async fn serve(scan_root: PathBuf, port: u16, insights_content: Option<Strin
 
     let insights = insights_content.map(|c| InsightsData { content: c });
 
-    // Generate a random auth token for this session.
+    // Generate a random auth token for this session using /dev/urandom.
     // It's embedded in the served HTML and required for all mutating API calls.
-    let auth_token = blake3::hash(
-        &std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_le_bytes(),
-    ).to_hex().to_string();
+    let auth_token = {
+        let mut raw = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut raw))
+            .expect("failed to read /dev/urandom");
+        blake3::hash(&raw).to_hex().to_string()
+    };
 
     let state = Arc::new(AppState {
         scan_root: scan_root.clone(),
@@ -307,9 +375,12 @@ pub async fn serve(scan_root: PathBuf, port: u16, insights_content: Option<Strin
 
     // Only allow requests from our own origin (localhost on this port).
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(
-            format!("http://127.0.0.1:{}", port).parse().unwrap(),
-        ));
+        .allow_origin([
+            format!("http://127.0.0.1:{}", port).parse::<axum::http::HeaderValue>().unwrap(),
+            format!("http://localhost:{}", port).parse::<axum::http::HeaderValue>().unwrap(),
+        ])
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/", get(index))

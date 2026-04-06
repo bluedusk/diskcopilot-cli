@@ -56,7 +56,17 @@ pub fn remove(path: &Path) -> Result<()> {
 
 /// Check if a path (or any of its ancestors) is in the safelist.
 pub fn is_protected(path: &Path) -> bool {
-    let entries = load().unwrap_or_default();
+    let entries = match load() {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to load safelist, treating '{}' as protected: {}",
+                path.display(),
+                err
+            );
+            return true;
+        }
+    };
     let canonical = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf());

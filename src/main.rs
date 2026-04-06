@@ -26,6 +26,7 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(
     name = "diskcopilot-cli",
+    version,
     about = "Fast Mac disk scanner and query tool",
     after_help = "\x1b[1mExamples:\x1b[0m
   diskcopilot-cli scan ~                           Scan home directory

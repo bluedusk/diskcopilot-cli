@@ -415,8 +415,8 @@ mod tests {
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
-            scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize(&HashMap::new())?;
+            let skipped = scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize(&skipped)?;
         }
 
         assert_eq!(progress.files(), 2, "should find 2 files");
@@ -450,8 +450,8 @@ mod tests {
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
-            scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize(&HashMap::new())?;
+            let skipped = scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize(&skipped)?;
         }
 
         // Only real.txt should be indexed (link is skipped)
@@ -472,8 +472,8 @@ mod tests {
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
-            scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize(&HashMap::new())?;
+            let skipped = scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize(&skipped)?;
         }
 
         assert_eq!(progress.dirs(), 1, "should find 1 dir (root only)");
@@ -515,7 +515,8 @@ mod tests {
         let result = {
             let mut writer = CacheWriter::new(&mut conn, 1000);
             let r = scan_directory(root, &config, &mut writer, &progress);
-            writer.finalize(&HashMap::new())?;
+            let skipped = r.as_ref().map(|s| s.clone()).unwrap_or_default();
+            writer.finalize(&skipped)?;
             r
         };
 
@@ -547,15 +548,126 @@ mod tests {
         };
         {
             let mut writer = CacheWriter::new(&mut conn, 1000);
-            scan_directory(root, &config, &mut writer, &progress)?;
-            writer.finalize(&HashMap::new())?;
+            let skipped = scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize(&skipped)?;
         }
 
-        // Only big.bin passes the filter
-        assert_eq!(progress.files(), 1);
+        // Only big.bin should have a file record
+        let file_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        assert_eq!(file_count, 1, "only big.bin should be in files table");
         let name: String =
             conn.query_row("SELECT name FROM files LIMIT 1", [], |r| r.get(0))?;
         assert_eq!(name, "big.bin");
+
+        // But the directory total_disk_size should include BOTH files
+        let dir_size: i64 = conn.query_row(
+            "SELECT total_disk_size FROM dirs WHERE parent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        // small.txt is 4 bytes, big.bin is 2 MiB — dir size must be > 2 MiB
+        // (it includes the small file's on-disk allocation)
+        assert!(
+            dir_size > 2 * 1024 * 1024,
+            "dir size ({}) should include small files that were below the threshold",
+            dir_size
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dir_size_matches_du() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        // Create a tree with mixed file sizes
+        let sub = root.join("subdir");
+        std::fs::create_dir(&sub)?;
+        std::fs::write(root.join("a.txt"), vec![0u8; 100])?;         // tiny
+        std::fs::write(root.join("b.bin"), vec![0u8; 500_000])?;     // medium
+        std::fs::write(sub.join("c.dat"), vec![0u8; 1_500_000])?;    // large
+        std::fs::write(sub.join("d.log"), vec![0u8; 200])?;          // tiny
+
+        // Calculate expected total using stat (same as du)
+        let expected: u64 = jwalk::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.path().symlink_metadata().ok())
+            .map(|m| m.blocks() * 512)
+            .sum();
+
+        // Scan with default mode (>= 1MB threshold)
+        let mut conn = make_conn();
+        let progress = ScanProgress::new();
+        let config = ScanConfig {
+            full: false,
+            min_file_size: 1024 * 1024,
+        };
+        {
+            let mut writer = CacheWriter::new(&mut conn, 1000);
+            let skipped = scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize(&skipped)?;
+        }
+
+        let scanned_size: i64 = conn.query_row(
+            "SELECT total_disk_size FROM dirs WHERE parent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+
+        assert_eq!(
+            scanned_size as u64, expected,
+            "scanned dir size ({}) should match du-style total ({})",
+            scanned_size, expected
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_symlink_not_double_counted() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        let real_file = root.join("real.dat");
+        std::fs::write(&real_file, vec![0u8; 50_000])?;
+        let link = root.join("link.dat");
+        std::os::unix::fs::symlink(&real_file, &link)?;
+
+        let mut conn = make_conn();
+        let progress = ScanProgress::new();
+        let config = ScanConfig {
+            full: true,
+            min_file_size: 0,
+        };
+        {
+            let mut writer = CacheWriter::new(&mut conn, 1000);
+            let skipped = scan_directory(root, &config, &mut writer, &progress)?;
+            writer.finalize(&skipped)?;
+        }
+
+        // Only 1 file record (the real file, not the symlink)
+        let file_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        assert_eq!(file_count, 1, "symlink should not create a file record");
+
+        // Dir size should only count the real file once
+        let dir_size: i64 = conn.query_row(
+            "SELECT total_disk_size FROM dirs WHERE parent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let real_size = real_file.symlink_metadata()?.blocks() * 512;
+        assert_eq!(
+            dir_size as u64, real_size,
+            "dir size ({}) should equal single file size ({}), not double-counted",
+            dir_size, real_size
+        );
 
         Ok(())
     }
